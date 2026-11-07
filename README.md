@@ -21,7 +21,7 @@ It is free and needs no account. Your video or song never leaves your device: th
 | | Time with AI | Tap along | Split evenly |
 |---|---|---|---|
 | What you do | wait | listen once and hold a button during each line | set every time yourself |
-| How exact | good with clear vocals; check the lines it reports | as exact as your timing | not at all until you edit |
+| How exact | good with clear vocals; check the orange lines | as exact as your timing | not at all until you edit |
 | Best for | a computer | a phone or a computer | a short song, or a rough start |
 | How long | several minutes, more on a slow computer | as long as the song | a moment, then your own work |
 
@@ -30,8 +30,8 @@ It is free and needs no account. Your video or song never leaves your device: th
 1. Click **Time with AI**.
 2. The first time, the browser downloads the timing model (about 300 MB) and shows the progress. After that it is kept, and later runs start right away.
 3. The AI listens to the whole song. The status line shows how far it is and about how many minutes are left. You can keep using the page, but leave the tab open.
-4. When it is done, all lines are on the timeline. If the status line says *"The AI was not sure about lines 12, 47…"*, check those lines first.
-5. Play the video and fix any line that is off (step 3 below).
+4. When it is done, all lines are on the timeline. If the status line says *"The AI was not sure about lines 12, 47…"*, those lines are orange on the timeline. Check them first.
+5. Play the video and fix any line that is off (step 3 below). An orange line turns back to normal when you change its times, or when you click **The times are right** in **Selected line**.
 
 For better results with AI-made songs: if your song tool (for example Suno) gives you the vocals as a separate file, open **Have the vocals as a separate file?** and choose it. The AI then listens to the voice only, and the video still uses the full song.
 
@@ -60,13 +60,24 @@ Good to know:
 
 ### 3. Check and fix
 
-Play the video and watch the subtitles. To fix a line:
+Play the video and watch the subtitles.
 
-- **Move it in time:** drag it on the timeline, or drag its left or right edge to change when it starts or ends.
+To find your way on the timeline:
+
+- Each line shows its number, the same number as in **All lines** and in the AI's messages.
+- When you select a line, or click **Previous** / **Next**, the timeline scrolls to it.
+- Click or drag along the time scale at the top of the timeline to move through the song.
+- The mouse wheel scrolls the timeline sideways. To zoom in and out, use **Zoom**, Ctrl + wheel (Cmd + wheel on a Mac) or pinch on a touchpad.
+- To hear one line again, click **Play line** in **All lines**.
+
+To fix a line:
+
+- **Move it in time:** drag it on the timeline, or drag its left or right edge to change when it starts or ends. An edge snaps to the playhead and to the edges of the other lines when it comes close. So the easiest way to set an end: pause the video where the line should end, then drag the right edge to the playhead. Hold Alt to drag without snapping.
 - **Exact times:** in **Selected line**, type the start and end, or click **Start here** / **End here** at the current video position.
+- **Many lines at once:** **Edit lines** shows every line with its text, start and end, so you can type them in one list.
 - **Position on the screen:** drag the subtitle in the preview.
 - **Text, size and width:** in **Selected line**. Colors, outline and a background box for all lines: in **Global style**.
-- **Split**, **Delete** and **+ Add line** change the lines. **Undo** takes back any change.
+- **Split** (in **All lines**) cuts a line in two, **Delete line** (in **Selected line**) removes it, and **+ Add line** adds a new one at the playhead. **Undo** takes back any change.
 
 ### 4. Export the video
 
@@ -79,7 +90,7 @@ Everything except the video file is saved in the browser automatically. If you c
 ### On a phone
 
 - **Tap along** is the easiest way on a phone. The big button is made for a thumb.
-- To edit on the timeline, first tap a line to select it, then drag it or its edges. Swiping over lines that are not selected scrolls the timeline.
+- The timeline is right under the video. To edit on it, first tap a line to select it, then drag it or its edges. Swiping over lines that are not selected scrolls the timeline. Drag along the time scale at its top to move through the song.
 - **Time with AI** also works, but it downloads 300 MB and is slow on a phone.
 - Exporting a long video on a phone can be slow or run out of memory. If that happens, save the project, open it on a computer, and export there.
 
@@ -90,10 +101,12 @@ Everything except the video file is saved in the browser automatically. If you c
 | Space | Play or pause |
 | ← / → | Previous or next line |
 | Shift + ← / → | Move 1 second back or forward |
-| Delete | Delete the selected line |
+| Delete or Backspace | Delete the selected line |
 | Space or Enter (hold) | During Tap along: the line is being sung |
 | Esc | During Tap along: stop |
 | Ctrl+Z / Ctrl+Y | Undo or redo |
+| Ctrl + mouse wheel | Zoom the timeline (with the pointer over it) |
+| Alt (hold while dragging) | Drag a line or edge without snapping |
 
 ## How it works
 
