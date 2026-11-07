@@ -88,11 +88,11 @@
         </aside>
       </div>
     </div>
-  </section>
-  <section class="panel timeline-panel">
-    <div class="panel-head"><span>Timeline</span><span class="hint">Select a line, then drag it or its edges</span></div>
-    <div class="timeline-tools"><div class="transport"><button type="button" class="ghost" id="timelineStart" title="Go to start">|&lt;</button><button type="button" class="ghost" id="timelinePrev" title="Previous line">&lt;</button><button type="button" class="primary" id="timelinePlay" title="Play / pause (Space)">Play</button><button type="button" class="ghost" id="timelineNext" title="Next line">&gt;</button></div><span class="timeline-readout" id="timelineReadout">00:00.00 / 00:00.00</span><div class="zoom-control"><span>Zoom</span><input id="timelineZoom" type="range" min="10" max="180" value="60" step="5" aria-label="Timeline zoom"><span id="zoomValue">60 px/s</span></div></div>
-    <div class="timeline"><div class="timeline-inner" id="timelineInner"><div id="ruler" class="ruler"></div><div class="track-label">Lyrics</div><div id="tracks" class="tracks"><div id="playhead" class="playhead"></div></div></div></div>
+    <section class="panel timeline-panel">
+      <div class="panel-head"><span>Timeline</span><span class="hint">Select a line, then drag it or its edges</span></div>
+      <div class="timeline-tools"><div class="transport"><button type="button" class="ghost" id="timelineStart" title="Go to start">|&lt;</button><button type="button" class="ghost" id="timelinePrev" title="Previous line">&lt;</button><button type="button" class="primary" id="timelinePlay" title="Play / pause (Space)">Play</button><button type="button" class="ghost" id="timelineNext" title="Next line">&gt;</button></div><span class="timeline-readout" id="timelineReadout">00:00.00 / 00:00.00</span><div class="zoom-control"><span>Zoom</span><input id="timelineZoom" type="range" min="10" max="180" value="60" step="1" aria-label="Timeline zoom" title="Zoom (also Ctrl + mouse wheel over the timeline)"><span id="zoomValue"></span></div></div>
+      <div class="timeline"><div class="timeline-inner" id="timelineInner"><div id="ruler" class="ruler" title="Click or drag here to move through the song"></div><div id="tracks" class="tracks"><div id="grid" class="grid"></div><div id="playhead" class="playhead"></div></div></div></div>
+    </section>
   </section>
   <section class="tap-bar hidden" id="tapBar" aria-label="Tap along">
     <div class="tap-info"><div class="hint" id="tapProgress">Line 1</div><div class="tap-next" id="tapNext"></div></div>

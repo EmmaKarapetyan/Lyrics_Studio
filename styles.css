@@ -325,10 +325,6 @@ button:disabled {
   font-size: 13px;
 }
 
-.timeline-panel {
-  margin-top: 12px;
-}
-
 .timeline-panel .panel-head {
   background: #20242d;
 }
@@ -388,43 +384,60 @@ button:disabled {
 
 .timeline-inner {
   position: relative;
-  min-width: 720px;
 }
 
+/* The time scale: click or drag along it to move the playhead. */
 .ruler {
-  height: 34px;
+  height: 30px;
   position: relative;
-  margin-left: 82px;
-  color: #868c98;
+  color: #9ba1ad;
   font-size: 10px;
   border-bottom: 1px solid #3a404c;
   font-variant-numeric: tabular-nums;
-  background: repeating-linear-gradient(90deg,transparent 0,transparent calc(10% - 1px),rgba(134,140,152,.24) 10%);
+  cursor: ew-resize;
+  touch-action: none;
+  overflow: hidden;
 }
 
 .tick {
   position: absolute;
-  transform: translateX(-50%);
-  top: 8px;
+  bottom: 0;
+  height: 6px;
+  border-left: 1px solid #454b58;
 }
 
-.track-label {
-  position: absolute;
-  left: 0;
-  width: 76px;
-  padding: 12px 10px 0 0;
-  color: #aeb3bf;
-  font-size: 11px;
-  text-align: right;
+.tick.major {
+  height: 100%;
+  padding: 5px 0 0 4px;
+  border-left-color: #666d7b;
+  line-height: 1;
+  white-space: nowrap;
 }
 
 .tracks {
   position: relative;
   min-height: 120px;
-  margin-left: 82px;
-  background: repeating-linear-gradient(90deg,#171b22 0,#171b22 calc(10% - 1px),#2a303b 10%);
+  background: #171b22;
   border-radius: 0 0 8px 8px;
   overflow: visible;
+}
+
+/* Lines down the timeline at the marks of the time scale */
+.grid {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.grid-line {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  border-left: 1px solid rgba(255,255,255,.03);
+}
+
+.grid-line.major {
+  border-left-color: rgba(255,255,255,.09);
 }
 
 .track-row {
@@ -450,10 +463,24 @@ button:disabled {
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
-  font-size: 11px;
+  font-size: 12px;
   cursor: grab;
   color: #edf4ff;
   box-shadow: inset 0 1px rgba(255,255,255,.16);
+}
+
+/* The line number, the same as in All lines and in the AI's messages */
+.clip::before {
+  content: attr(data-n);
+  margin-right: 5px;
+  font-weight: 800;
+  opacity: .7;
+}
+
+/* A line the AI was not sure about */
+.clip.unsure {
+  background: linear-gradient(135deg,#c9802c,#b8602a);
+  border-color: #ffd7a3;
 }
 
 .clip:active {
@@ -534,6 +561,26 @@ button:disabled {
 
 .block.selected {
   background: #29314d;
+}
+
+.block.unsure {
+  box-shadow: inset 3px 0 #e0913a;
+}
+
+.unsure-note {
+  margin-bottom: 12px;
+  padding: 9px 11px;
+  border: 1px solid #7a5426;
+  border-radius: 8px;
+  background: #2e2418;
+  color: #ffd7a3;
+  font-size: 12px;
+}
+
+.unsure-note button {
+  margin-top: 7px;
+  padding: 6px 10px;
+  font-size: 12px;
 }
 
 .block-top {
@@ -702,13 +749,13 @@ button:disabled {
 }
 
 @media (max-width:1050px) {
-  .main-editor {
-    grid-template-columns: 1fr;
+  /* One column. The timeline moves up, right under the preview, so a line can be dragged while
+     the subtitles are in view; the line editor comes after it. */
+  .main-editor,.left-stack,.right-stack {
+    display: contents;
   }
-  .left-stack,.right-stack {
-    display: flex;
-    flex-direction: column;
-    gap: 12px;
+  .right-panel {
+    order: 1;
   }
   .block-list {
     display: grid;
@@ -745,11 +792,8 @@ button:disabled {
     min-height: 42px;
     padding: 10px 11px;
   }
-  .workspace,.main-editor {
-    display: block;
-  }
-  .left-stack,.right-stack {
-    display: block;
+  .workspace {
+    gap: 0;
   }
   .panel {
     margin-bottom: 10px;
@@ -923,6 +967,9 @@ button:disabled {
 @media (pointer: coarse) {
   .clip .handle {
     width: 14px;
+  }
+  .clip {
+    padding: 4px 17px;
   }
 }
 

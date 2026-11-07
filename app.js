@@ -113,6 +113,7 @@ function sanitizeBlocks(list) {
     const block = { text: String(b.text ?? ""), start, end, x: Math.min(85, Math.max(15, x)), y: Math.min(88, Math.max(12, y)) };
     if (Number.isFinite(number(b.size))) block.size = Math.min(160, Math.max(12, number(b.size)));
     if (Number.isFinite(number(b.width))) block.width = Math.min(100, Math.max(20, number(b.width)));
+    if (b.unsure === true) block.unsure = true;
     return block;
   });
 }
@@ -461,6 +462,7 @@ function tapDown() {
   const index = tap.order[tap.position];
   tap.holding = true;
   tap.pending.delete(index);
+  delete blocks[index].unsure;
   blocks[index].start = tapTime();
   blocks[index].end = video.currentTime + 0.05; // grows while the button is held (see playbackLoop)
   updateTapBar();
@@ -539,6 +541,7 @@ function renderPreview() {
     selected = i;
     renderInspector();
     renderBlocks();
+    markSelectedClip();
   }
 
   const active = blocks.filter((b, index) => isShown(index) && video.currentTime >= b.start && video.currentTime < b.end);
@@ -556,6 +559,7 @@ function renderPreview() {
     selected = blocks.indexOf(b);
     renderInspector();
     renderBlocks();
+    markSelectedClip();
   }
   const wrap = $("videoWrap").getBoundingClientRect();
   const mediaBounds = getMediaBounds();
@@ -765,6 +769,7 @@ $("generate").onclick = async () => {
       .filter(i => ranges[i] && lineConfidence(logProbs, vocabSize, tokens, spans, ranges[i]) < DOUBTFUL_CONFIDENCE)
       .map(i => i + 1);
 
+    doubtful.forEach(n => { newBlocks[n - 1].unsure = true; });
     pushUndo();
     blocks = newBlocks;
     normalizeBlocks();
@@ -773,7 +778,7 @@ $("generate").onclick = async () => {
     revealPreview();
     const list = doubtful.slice(0, 8).join(", ") + (doubtful.length > 8 ? " and more" : "");
     status(`Timed ${blocks.length} lines. ` + (doubtful.length
-      ? `The AI was not sure about line${doubtful.length > 1 ? "s" : ""} ${list}, so check ${doubtful.length > 1 ? "those" : "it"} first.`
+      ? `The AI was not sure about line${doubtful.length > 1 ? "s" : ""} ${list}, so check ${doubtful.length > 1 ? "those" : "it"} first. ${doubtful.length > 1 ? "They are" : "It is"} orange on the timeline.`
       : "Play the video to check them, and drag any line that is off."), 100);
   } catch (err) {
     console.error(err);
@@ -790,14 +795,18 @@ $("generate").onclick = async () => {
 function renderInspector() {
   const box = $("inspector"), b = blocks[selected];
   if (!b) { box.innerHTML = '<div class="hint">Select a line on the timeline or in the list to edit it.</div>'; return; }
-  box.innerHTML = `<div class="field"><label for="editText">Text</label><textarea id="editText" class="lyrics" style="height:70px">${escapeHtml(b.text)}</textarea></div><div class="editor-row"><label>Text size<input id="editSize" type="number" min="12" max="160" value="${b.size ?? style.size}"></label><label>Line width (%)<input id="editWidth" type="number" min="20" max="100" value="${b.width ?? 80}"></label></div><div class="editor-row" style="margin-top:8px"><label>Start (s)<input id="editStart" type="number" step=".01" value="${b.start.toFixed(2)}"></label><label>End (s)<input id="editEnd" type="number" step=".01" value="${b.end.toFixed(2)}"></label></div><div class="row" style="margin-top:8px"><button type="button" class="ghost" id="setStart">Start here</button><button type="button" class="ghost" id="setEnd">End here</button></div><div class="hint" style="margin-top:5px">"Here" means the current video position.</div><div class="field" style="margin-top:14px"><label>Position <span class="hint">X ${Math.round(b.x)}% · Y ${Math.round(b.y)}%</span></label><input id="posX" class="range" type="range" min="5" max="95" value="${b.x}" aria-label="Horizontal position"><input id="posY" class="range" type="range" min="5" max="95" value="${b.y}" aria-label="Vertical position"></div><button type="button" class="danger" id="deleteSelected" style="width:100%">Delete line</button>`;
+  const unsureNote = b.unsure
+    ? '<div class="unsure-note">The AI was not sure about this line. Play it, and fix the times if they are off.<br><button type="button" class="ghost" id="markRight">The times are right</button></div>'
+    : "";
+  box.innerHTML = `${unsureNote}<div class="field"><label for="editText">Text</label><textarea id="editText" class="lyrics" style="height:70px">${escapeHtml(b.text)}</textarea></div><div class="editor-row"><label>Text size<input id="editSize" type="number" min="12" max="160" value="${b.size ?? style.size}"></label><label>Line width (%)<input id="editWidth" type="number" min="20" max="100" value="${b.width ?? 80}"></label></div><div class="editor-row" style="margin-top:8px"><label>Start (s)<input id="editStart" type="number" step=".01" value="${b.start.toFixed(2)}"></label><label>End (s)<input id="editEnd" type="number" step=".01" value="${b.end.toFixed(2)}"></label></div><div class="row" style="margin-top:8px"><button type="button" class="ghost" id="setStart">Start here</button><button type="button" class="ghost" id="setEnd">End here</button></div><div class="hint" style="margin-top:5px">"Here" means the current video position.</div><div class="field" style="margin-top:14px"><label>Position <span class="hint">X ${Math.round(b.x)}% · Y ${Math.round(b.y)}%</span></label><input id="posX" class="range" type="range" min="5" max="95" value="${b.x}" aria-label="Horizontal position"><input id="posY" class="range" type="range" min="5" max="95" value="${b.y}" aria-label="Vertical position"></div><button type="button" class="danger" id="deleteSelected" style="width:100%">Delete line</button>`;
   $("editText").oninput = e => { b.text = e.target.value; renderPreview(); renderBlocks(); renderTimeline(); };
   $("editSize").oninput = e => { b.size = Math.max(12, Math.min(160, Number(e.target.value) || style.size)); renderPreview(); };
   $("editWidth").oninput = e => { b.width = Math.max(20, Math.min(100, Number(e.target.value) || 80)); renderPreview(); };
-  $("editStart").oninput = e => { b.start = +e.target.value; clampBlock(b); renderTimeline(); };
-  $("editEnd").oninput = e => { b.end = +e.target.value; clampBlock(b); renderTimeline(); };
-  $("setStart").onclick = () => { pushUndo(); b.start = video.currentTime; clampBlock(b); renderInspector(); renderTimeline(); };
-  $("setEnd").onclick = () => { pushUndo(); b.end = video.currentTime; clampBlock(b); renderInspector(); renderTimeline(); };
+  $("editStart").oninput = e => { b.start = +e.target.value; delete b.unsure; clampBlock(b); renderTimeline(); };
+  $("editEnd").oninput = e => { b.end = +e.target.value; delete b.unsure; clampBlock(b); renderTimeline(); };
+  $("setStart").onclick = () => { pushUndo(); b.start = video.currentTime; delete b.unsure; clampBlock(b); renderInspector(); renderTimeline(); };
+  $("setEnd").onclick = () => { pushUndo(); b.end = video.currentTime; delete b.unsure; clampBlock(b); renderInspector(); renderTimeline(); };
+  if (b.unsure) $("markRight").onclick = () => { pushUndo(); delete b.unsure; renderAll(); };
   $("posX").oninput = e => { b.x = +e.target.value; renderPreview(); };
   $("posY").oninput = e => { b.y = +e.target.value; renderPreview(); };
   $("deleteSelected").onclick = () => deleteBlock(selected);
@@ -854,6 +863,7 @@ function selectBlock(i, seek = true) {
     selectionOverride = -1;
   }
   renderAll();
+  revealOnTimeline(blocks[i].start, blocks[i].end);
 }
 
 function sortedBlockIndices() {
@@ -877,7 +887,7 @@ function renderBlocks() {
   sortedBlockIndices().forEach((i, displayIndex) => {
     const b = blocks[i];
     const el = document.createElement("div");
-    el.className = "block" + (i === selected ? " selected" : "");
+    el.className = "block" + (i === selected ? " selected" : "") + (b.unsure ? " unsure" : "");
     el.innerHTML = `<div class="block-top"><span>#${displayIndex + 1}</span><span>${fmt(b.start)} → ${fmt(b.end)}</span></div><div class="block-text">${escapeHtml(b.text)}</div><div class="block-actions"><button type="button" class="ghost" data-play>Play line</button><button type="button" class="ghost" data-split>Split</button></div>`;
     el.onclick = e => { if (e.target.tagName === "BUTTON") return; selectBlock(i, true); };
     el.querySelector("[data-play]").onclick = () => { selectBlock(i, true); playVideo(); };
@@ -901,8 +911,8 @@ function renderEditBlocks() {
       selectBlock(i, true);
     };
     textInput.oninput = e => { b.text = e.target.value; renderPreview(); renderBlocks(); renderTimeline(); };
-    startInput.oninput = e => { b.start = Number(e.target.value); clampBlock(b); renderPreview(); renderBlocks(); renderTimeline(); };
-    endInput.oninput = e => { b.end = Number(e.target.value); clampBlock(b); renderPreview(); renderBlocks(); renderTimeline(); };
+    startInput.oninput = e => { b.start = Number(e.target.value); delete b.unsure; clampBlock(b); renderPreview(); renderBlocks(); renderTimeline(); };
+    endInput.oninput = e => { b.end = Number(e.target.value); delete b.unsure; clampBlock(b); renderPreview(); renderBlocks(); renderTimeline(); };
     startInput.onchange = () => renderEditBlocks();
     endInput.onchange = () => renderEditBlocks();
     box.appendChild(row);
@@ -913,6 +923,25 @@ function renderEditBlocks() {
 // Timeline
 // ---------------------------------------------------------------------------
 
+// Where things are on the timeline. An x position is counted in pixels from the left edge of the
+// scrollable content, so it can be compared with timelineBox.scrollLeft.
+function timelineGeometry() {
+  const box = timelineBox.getBoundingClientRect(), area = tracks.getBoundingClientRect();
+  const d = Math.max(duration(), 0.01);
+  return { offset: area.left - box.left + timelineBox.scrollLeft, width: area.width, d };
+}
+const timeToX = (t, g) => g.offset + t / g.d * g.width;
+const xToTime = (x, g) => (x - g.offset) / g.width * g.d;
+
+// Scrolls the timeline sideways so the time from start to end is in view, unless it already is.
+function revealOnTimeline(start, end = start) {
+  const g = timelineGeometry(), view = timelineBox.clientWidth, margin = 30;
+  const left = timeToX(start, g), right = timeToX(end, g), now = timelineBox.scrollLeft;
+  if (left >= now + margin && right <= now + view - margin) return;
+  const target = right - left > view - 2 * margin ? left - margin : (left + right - view) / 2;
+  timelineBox.scrollTo({ left: Math.max(0, target), behavior: "smooth" });
+}
+
 // While playing, the timeline scrolls along so the playhead stays visible, except for a few
 // seconds after the user scrolls it themselves.
 let userScrolledTimelineAt = 0;
@@ -922,7 +951,7 @@ let userScrolledTimelineAt = 0;
 function followPlayhead() {
   if (video.paused || drag || performance.now() - userScrolledTimelineAt < 3000) return;
   const box = timelineBox.getBoundingClientRect(), head = $("playhead").getBoundingClientRect();
-  if (head.left < box.left + 90 || head.right > box.right - 30) {
+  if (head.left < box.left + 30 || head.right > box.right - 30) {
     timelineBox.scrollLeft += head.left - box.left - box.width * 0.25;
   }
 }
@@ -941,13 +970,41 @@ function updatePlayhead() {
   followPlayhead();
 }
 
+// The time scale has a labelled mark every few seconds and small marks between them. The spacing
+// follows the zoom, so the labels never crowd together and are never far apart.
+const RULER_STEPS = [[1, 0.25], [2, 0.5], [5, 1], [10, 2], [15, 5], [30, 10], [60, 15], [120, 30]];
+const clockLabel = t => `${Math.floor(t / 60)}:${String(Math.floor(t % 60)).padStart(2, "0")}`;
+let rulerKey = "";
+
+function renderRuler(d, width) {
+  const [major, minor] = RULER_STEPS.find(([step]) => step * width / d >= 70) || RULER_STEPS.at(-1);
+  const key = `${d}|${major}`;
+  if (key === rulerKey) return; // the marks are placed in %, so they only change with the spacing
+  rulerKey = key;
+  const perMajor = Math.round(major / minor);
+  let marks = "", lines = "";
+  for (let k = 0; k * minor <= d + 1e-6; k++) {
+    const t = k * minor, left = `left:${(t / d * 100).toFixed(4)}%`, isMajor = k % perMajor === 0;
+    marks += isMajor ? `<span class="tick major" style="${left}">${clockLabel(t)}</span>` : `<span class="tick" style="${left}"></span>`;
+    lines += `<i class="grid-line${isMajor ? " major" : ""}" style="${left}"></i>`;
+  }
+  $("ruler").innerHTML = marks;
+  $("grid").innerHTML = lines;
+}
+
+function updateZoomReadout(d, width) {
+  const seconds = Math.min(d, timelineBox.clientWidth * d / width);
+  $("zoomValue").textContent = `${seconds < 10 ? seconds.toFixed(1) : Math.round(seconds)} s visible`;
+}
+
 function renderTimeline() {
-  const ruler = $("ruler"), inner = $("timelineInner");
-  tracks.querySelectorAll(".clip").forEach(x => x.remove());
+  const inner = $("timelineInner");
   tracks.querySelectorAll(".track-row").forEach(x => x.remove());
-  ruler.innerHTML = "";
-  const d = Math.max(duration(), 0.01), width = Math.max(720, d * timelineScale);
+  // A short song fills the visible width; a longer one gets timelineScale pixels per second.
+  const padding = parseFloat(getComputedStyle(timelineBox).paddingLeft) || 0;
+  const d = Math.max(duration(), 0.01), width = Math.max(timelineBox.clientWidth - 2 * padding, 300, d * timelineScale);
   inner.style.width = width + "px";
+  renderRuler(d, width);
 
   // Lines that touch or overlap go to different rows so both stay easy to grab.
   const minPixelBufferInSeconds = (14 / width) * d;
@@ -969,21 +1026,17 @@ function renderTimeline() {
     tracks.appendChild(row);
     rows.push(row);
   }
-  const step = d > 90 ? 10 : d > 45 ? 5 : 2;
-  for (let t = 0; t <= d + 0.001; t += step) {
-    const tick = document.createElement("span");
-    tick.className = "tick";
-    tick.style.left = (t / d * 100) + "%";
-    tick.textContent = fmt(t);
-    ruler.appendChild(tick);
-  }
+  // Each line shows its number, the same as in All lines and in the AI's messages.
+  const number = new Map(sortedBlockIndices().map((index, k) => [index, k + 1]));
   blocks.forEach((b, i) => {
     const lane = laneMap.get(b) || 0, row = rows[Math.min(lane, rows.length - 1)] || rows[0], el = document.createElement("div");
-    el.className = "clip" + (i === selected ? " selected" : "");
+    el.className = "clip" + (i === selected ? " selected" : "") + (b.unsure ? " unsure" : "");
     el.dataset.index = i;
+    el.dataset.n = number.get(i);
+    el.title = `${number.get(i)}. ${b.text}\n${fmt(b.start)} → ${fmt(b.end)}`;
     el.style.left = (b.start / d * 100) + "%";
     el.style.width = Math.max((b.end - b.start) / d * 100, 0.2) + "%";
-    el.textContent = b.text;
+    el.append(b.text);
     el.onpointerdown = e => startClipDrag(e, i, "move");
     ["left", "right"].forEach(side => {
       const h = document.createElement("i");
@@ -993,10 +1046,56 @@ function renderTimeline() {
     });
     row.appendChild(el);
   });
+  updateZoomReadout(d, width);
   updatePlayhead();
 }
 
+// While the video plays, the selected line changes often; mark it without drawing everything again.
+function markSelectedClip() {
+  tracks.querySelectorAll(".clip").forEach(el => el.classList.toggle("selected", Number(el.dataset.index) === selected));
+}
+
 function renderAll() { renderBlocks(); renderEditBlocks(); renderInspector(); renderTimeline(); renderPreview(); }
+
+// Zoom. The time at anchorX (pixels from the left edge of the visible timeline) stays in the same
+// place on screen: by default the playhead if it is in view, otherwise the middle.
+const ZOOM_MIN = Number($("timelineZoom").min), ZOOM_MAX = Number($("timelineZoom").max);
+
+function setZoom(scale, anchorX = null) {
+  scale = Math.round(Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, scale)));
+  if (scale === timelineScale) return;
+  const g = timelineGeometry(), view = timelineBox.clientWidth;
+  if (anchorX === null) {
+    const head = timeToX(video.currentTime || 0, g) - timelineBox.scrollLeft;
+    anchorX = head >= 0 && head <= view ? head : view / 2;
+  }
+  const anchorTime = xToTime(timelineBox.scrollLeft + anchorX, g);
+  timelineScale = scale;
+  $("timelineZoom").value = scale;
+  renderTimeline();
+  timelineBox.scrollLeft = timeToX(anchorTime, timelineGeometry()) - anchorX;
+}
+
+$("timelineZoom").oninput = e => setZoom(Number(e.target.value));
+
+// The mouse wheel scrolls the timeline sideways; at either end it scrolls the page again.
+// Ctrl + wheel, or pinching on a touchpad, zooms in and out around the pointer.
+timelineBox.addEventListener("wheel", e => {
+  if (e.ctrlKey || e.metaKey) {
+    e.preventDefault();
+    setZoom(timelineScale * Math.exp(-e.deltaY * 0.002), e.clientX - timelineBox.getBoundingClientRect().left);
+    return;
+  }
+  if (e.shiftKey || Math.abs(e.deltaX) >= Math.abs(e.deltaY)) return; // already sideways
+  const step = e.deltaY * (e.deltaMode === 1 ? 40 : e.deltaMode === 2 ? timelineBox.clientWidth : 1);
+  const max = timelineBox.scrollWidth - timelineBox.clientWidth;
+  if (max <= 0 || (step < 0 && timelineBox.scrollLeft <= 0) || (step > 0 && timelineBox.scrollLeft >= max - 1)) return;
+  e.preventDefault();
+  timelineBox.scrollLeft += step;
+}, { passive: false });
+
+// A short song fills the timeline, so its width depends on the window.
+new ResizeObserver(() => renderTimeline()).observe(timelineBox);
 
 // A tap on a line selects it and jumps to its start. Dragging the line moves it; dragging an edge
 // changes its start or end. On touch screens only the selected line can be dragged (see the CSS),
@@ -1016,6 +1115,27 @@ function startClipDrag(e, index, type) {
   try { tracks.setPointerCapture(e.pointerId); } catch { /* the pointer is already gone */ }
 }
 
+// While a line or an edge is dragged, it snaps to the playhead and to the edges of the other lines
+// when it comes within a few pixels of them. So lines can meet exactly, and an edge can be put
+// exactly where the video is paused. Holding Alt turns snapping off.
+const SNAP_PIXELS = 8;
+
+function snapPoints() {
+  const points = blocks.flatMap((other, j) => j === drag.index ? [] : [other.start, other.end]);
+  // When a whole line is moved, its old start (where a tap left the playhead) is not a target.
+  if (video.src && !(drag.type === "move" && Math.abs(video.currentTime - drag.start) < 0.01)) points.push(video.currentTime);
+  return points;
+}
+
+function nearestSnap(t, points, tolerance) {
+  let best = null, bestDistance = tolerance;
+  for (const p of points) {
+    const distance = Math.abs(p - t);
+    if (distance <= bestDistance) { best = p; bestDistance = distance; }
+  }
+  return best;
+}
+
 tracks.onpointermove = e => {
   if (!drag || drag.type === "position" || drag.type === "tap") return;
   const b = blocks[drag.index];
@@ -1025,15 +1145,21 @@ tracks.onpointermove = e => {
     drag.moved = true;
     pushUndo(drag.undo);
     selected = drag.index;
+    delete b.unsure; // the user is fixing this line
   }
-  const d = drag.duration;
-  const r = tracks.getBoundingClientRect(), delta = (e.clientX - drag.startX) / r.width * d;
+  const d = drag.duration, r = tracks.getBoundingClientRect(), secondsPerPixel = d / r.width;
+  const points = e.altKey ? [] : snapPoints(), tolerance = SNAP_PIXELS * secondsPerPixel;
   if (drag.type === "move") {
     const length = drag.end - drag.start;
-    b.start = Math.max(0, Math.min(d - length, drag.start + delta));
+    let start = drag.start + (e.clientX - drag.startX) * secondsPerPixel;
+    const toStart = nearestSnap(start, points, tolerance), toEnd = nearestSnap(start + length, points, tolerance);
+    if (toStart !== null && (toEnd === null || Math.abs(toStart - start) <= Math.abs(toEnd - start - length))) start = toStart;
+    else if (toEnd !== null) start = toEnd - length;
+    b.start = Math.max(0, Math.min(d - length, start));
     b.end = b.start + length;
   } else {
-    const t = Math.max(0, Math.min(d, (e.clientX - r.left) / r.width * d));
+    let t = Math.max(0, Math.min(d, (e.clientX - r.left) * secondsPerPixel));
+    t = nearestSnap(t, points, tolerance) ?? t;
     if (drag.type === "left") b.start = Math.min(t, b.end - .05);
     else if (drag.type === "right") b.end = Math.max(t, b.start + .05);
   }
@@ -1063,19 +1189,36 @@ function seekTimeline(e, element) {
   updatePlayhead();
 }
 
-// Clicking an empty part of the timeline or the ruler moves the playhead there.
+// Clicking an empty part of the timeline moves the playhead there.
 tracks.onclick = e => {
   if (performance.now() < suppressClickUntil) return;
   if (e.target === tracks || e.target.classList.contains("track-row")) seekTimeline(e, tracks);
 };
-$("ruler").onclick = e => seekTimeline(e, $("ruler"));
+
+// Clicking or dragging along the time scale moves the playhead, with a mouse or a finger.
+let scrubbing = false;
+const ruler = $("ruler");
+ruler.onpointerdown = e => {
+  if (e.button > 0 || !video.src) return;
+  scrubbing = true;
+  try { ruler.setPointerCapture(e.pointerId); } catch { /* the pointer is already gone */ }
+  seekTimeline(e, ruler);
+};
+ruler.onpointermove = e => { if (scrubbing) seekTimeline(e, ruler); };
+ruler.onpointerup = ruler.onpointercancel = () => { scrubbing = false; };
+
+// After a jump while paused, for example with the video's own controls or Shift + arrow, the
+// timeline scrolls to the playhead. (Selecting a line scrolls to the whole line; see selectBlock.)
+video.addEventListener("seeked", () => {
+  if (video.paused && !scrubbing && !drag && selectionOverride < 0) revealOnTimeline(video.currentTime);
+});
+
 $("timelineStart").onclick = () => { if (!video.src) return; video.currentTime = 0; updatePlayhead(); };
 $("timelinePlay").onclick = togglePlay;
 $("timelinePrev").onclick = () => stepBlock(-1);
 $("timelineNext").onclick = () => stepBlock(1);
 $("prevBlock").onclick = () => stepBlock(-1);
 $("nextBlock").onclick = () => stepBlock(1);
-$("timelineZoom").oninput = e => { timelineScale = Number(e.target.value); $("zoomValue").textContent = `${timelineScale} px/s`; renderTimeline(); };
 
 $("addBlock").onclick = () => {
   pushUndo();
@@ -1518,7 +1661,6 @@ $("closeSteps").onclick = () => {
 if (matchMedia("(max-width: 680px)").matches) {
   timelineScale = 30;
   $("timelineZoom").value = timelineScale;
-  $("zoomValue").textContent = `${timelineScale} px/s`;
 }
 
 setActiveTab("selected");
