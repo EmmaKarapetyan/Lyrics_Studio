@@ -75,6 +75,7 @@ To fix a line:
 - **Move it in time:** drag it on the timeline, or drag its left or right edge to change when it starts or ends. An edge snaps to the playhead and to the edges of the other lines when it comes close. So the easiest way to set an end: pause the video where the line should end, then drag the right edge to the playhead. Hold Alt to drag without snapping.
 - **Exact times:** in **Selected line**, type the start and end, or click **Start here** / **End here** at the current video position.
 - **Many lines at once:** **Edit lines** shows every line with its text, start and end, so you can type them in one list.
+- **Change the order:** in **Edit lines**, drag a line by its number, or click ▲ / ▼ next to it. The times stay in their places and the lines move: the moved line takes the times of its new place, and the lines it passes shift by one place. If the **Lyrics** box has the same lines, it gets the new order too, so Tap along still works.
 - **Position on the screen:** drag the subtitle in the preview.
 - **Text, size and width:** in **Selected line**. Colors, outline and a background box for all lines: in **Global style**.
 - **Split** (in **All lines**) cuts a line in two, **Delete line** (in **Selected line**) removes it, and **+ Add line** adds a new one at the playhead. **Undo** takes back any change.

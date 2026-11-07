@@ -899,17 +899,22 @@ function renderBlocks() {
 function renderEditBlocks() {
   const box = $("editBlockList");
   box.innerHTML = blocks.length
-    ? '<div class="list-head"><span>#</span><span>Text</span><span>Start (s)</span><span>End (s)</span></div>'
+    ? '<div class="hint list-hint">To change the order, drag a line by its number or use ▲ ▼. The times stay in place; the lines move.</div><div class="list-head"><span>#</span><span>Text</span><span>Start (s)</span><span>End (s)</span></div>'
     : '<div class="hint">No lines yet.</div>';
-  sortedBlockIndices().forEach((i, displayIndex) => {
-    const b = blocks[i], row = document.createElement("div");
+  const order = sortedBlockIndices();
+  order.forEach((i, displayIndex) => {
+    const b = blocks[i], row = document.createElement("div"), n = displayIndex + 1;
     row.className = "edit-block-row" + (i === selected ? " selected" : "");
-    row.innerHTML = `<strong>${displayIndex + 1}</strong><textarea aria-label="Text of line ${displayIndex + 1}">${escapeHtml(b.text)}</textarea><input type="text" inputmode="decimal" autocomplete="off" aria-label="Start time of line ${displayIndex + 1}" value="${b.start.toFixed(2)}"><input type="text" inputmode="decimal" autocomplete="off" aria-label="End time of line ${displayIndex + 1}" value="${b.end.toFixed(2)}">`;
+    row.innerHTML = `<div class="move-cell"><button type="button" class="move-btn" data-move="-1" title="Move up" aria-label="Move line ${n} up"${displayIndex === 0 ? " disabled" : ""}>▲</button><strong class="move-grip" title="Drag to move this line">${n}</strong><button type="button" class="move-btn" data-move="1" title="Move down" aria-label="Move line ${n} down"${displayIndex === order.length - 1 ? " disabled" : ""}>▼</button></div><textarea aria-label="Text of line ${n}">${escapeHtml(b.text)}</textarea><input type="text" inputmode="decimal" autocomplete="off" aria-label="Start time of line ${n}" value="${b.start.toFixed(2)}"><input type="text" inputmode="decimal" autocomplete="off" aria-label="End time of line ${n}" value="${b.end.toFixed(2)}">`;
     const [textInput, startInput, endInput] = row.querySelectorAll("textarea, input");
     row.onclick = e => {
-      if (e.target === textInput || e.target === startInput || e.target === endInput) return;
+      if (e.target.closest("textarea, input, button") || performance.now() < suppressRowClickUntil) return;
       selectBlock(i, true);
     };
+    row.querySelectorAll(".move-btn").forEach(btn => {
+      btn.onclick = () => moveLine(displayIndex, displayIndex + Number(btn.dataset.move), btn.dataset.move);
+    });
+    row.querySelector(".move-grip").onpointerdown = e => startReorder(e, displayIndex);
     textInput.oninput = e => { b.text = e.target.value; renderPreview(); renderBlocks(); renderTimeline(); };
     startInput.oninput = e => { b.start = Number(e.target.value); delete b.unsure; clampBlock(b); renderPreview(); renderBlocks(); renderTimeline(); };
     endInput.oninput = e => { b.end = Number(e.target.value); delete b.unsure; clampBlock(b); renderPreview(); renderBlocks(); renderTimeline(); };
@@ -917,6 +922,116 @@ function renderEditBlocks() {
     endInput.onchange = () => renderEditBlocks();
     box.appendChild(row);
   });
+}
+
+// Changing the order of the lines. The lines are always listed in time order, so a moved line
+// cannot keep its own times. Instead the times stay in their places and the lines move: the moved
+// line takes the times of its new place, and the lines in between shift by one place.
+function moveLine(from, to, focusButton = null) {
+  const order = sortedBlockIndices();
+  if (from === to || to < 0 || to >= order.length) return;
+  pushUndo();
+  const places = order.map(i => [blocks[i].start, blocks[i].end]);
+  const oldTexts = order.map(i => blocks[i].text);
+  const lines = order.map(i => blocks[i]);
+  const [moving] = lines.splice(from, 1);
+  lines.splice(to, 0, moving);
+  lines.forEach((b, k) => { [b.start, b.end] = places[k]; });
+  blocks = lines;
+  const lyricsUpdated = reorderLyricsBox(oldTexts, lines.map(b => b.text));
+  selectBlock(to, true);
+  const row = $("editBlockList").querySelectorAll(".edit-block-row")[to];
+  row?.scrollIntoView({ block: "nearest" });
+  // After a click on an arrow, keep the focus on the same arrow, so it can be pressed again.
+  if (focusButton) row?.querySelector(`.move-btn[data-move="${focusButton}"]:not(:disabled)`)?.focus();
+  status(`Moved "${shorten(moving.text)}" to place ${to + 1}. The times stayed in their places.${lyricsUpdated ? " The Lyrics box has the new order too." : ""}`);
+}
+
+// If the Lyrics box held exactly these lines, it gets the new order too, so it stays the same as the
+// timeline (Tap along compares the two). Section tags and empty lines stay where they are.
+function reorderLyricsBox(oldTexts, newTexts) {
+  const current = lyricLines();
+  if (current.length !== oldTexts.length || current.some((text, k) => text !== oldTexts[k])) return false;
+  if (newTexts.some(text => text.includes("\n"))) return false;
+  let k = 0;
+  lyrics.value = lyrics.value.split(/\r?\n/).map(raw => {
+    const text = raw.trim();
+    return text && !/^\[[^\]]*\]$/.test(text) ? newTexts[k++] : raw;
+  }).join("\n");
+  return true;
+}
+
+// Dragging a line by its number. The row follows the pointer, the other rows slide apart to show
+// where it will go, and near the top or bottom edge the list (or, on a phone, the page) scrolls.
+let reorder = null, suppressRowClickUntil = 0;
+
+function reorderScroller() {
+  const list = $("editBlockList");
+  return list.scrollHeight > list.clientHeight + 1 ? list : null; // null: the page scrolls
+}
+
+function startReorder(e, from) {
+  if (e.button > 0 || reorder) return;
+  e.preventDefault(); // no text selection, and no scrolling on a touch screen (see the CSS)
+  const grip = e.currentTarget, list = $("editBlockList"), rows = [...list.querySelectorAll(".edit-block-row")];
+  try { grip.setPointerCapture(e.pointerId); } catch { /* the pointer is already gone */ }
+  const scroller = reorderScroller();
+  // Heights are measured from the top of the scrolling content, so they stay right while it scrolls.
+  const base = () => scroller ? scroller.scrollTop - scroller.getBoundingClientRect().top : window.scrollY;
+  const startBase = base();
+  const middles = rows.map(row => { const box = row.getBoundingClientRect(); return box.top + box.height / 2 + startBase; });
+  const shift = rows[from].offsetHeight + (parseFloat(getComputedStyle(list).rowGap) || 0);
+  reorder = { from, to: from, rows, list, scroller, base, startBase, middles, shift, startY: e.clientY, y: e.clientY, moved: false, frame: 0 };
+  grip.onpointermove = ev => { if (reorder) reorder.y = ev.clientY; };
+  grip.onpointerup = () => endReorder(true);
+  grip.onpointercancel = () => endReorder(false);
+  reorder.frame = requestAnimationFrame(reorderFrame);
+}
+
+function reorderFrame() {
+  const r = reorder;
+  if (!r) return;
+  r.frame = requestAnimationFrame(reorderFrame);
+  if (!r.moved) {
+    if (Math.abs(r.y - r.startY) < 5) return; // a small wobble is still a click
+    r.moved = true;
+    r.rows[r.from].classList.add("moving");
+    r.list.classList.add("reordering");
+  }
+  // Scroll by itself near the edges: the closer to the edge, the faster.
+  const edge = r.scroller ? r.scroller.getBoundingClientRect() : { top: 0, bottom: window.innerHeight };
+  const zone = 48, speed = 14;
+  const step = r.y < edge.top + zone ? -speed * Math.min(1, (edge.top + zone - r.y) / zone)
+    : r.y > edge.bottom - zone ? speed * Math.min(1, (r.y - edge.bottom + zone) / zone) : 0;
+  if (step) { if (r.scroller) r.scroller.scrollTop += step; else window.scrollBy(0, step); }
+  // The dragged row follows the pointer.
+  const pointer = r.y + r.base();
+  r.rows[r.from].style.transform = `translateY(${pointer - r.startY - r.startBase}px)`;
+  // The new place: the first earlier row whose middle is below the pointer, or the last later row
+  // whose middle is above it. The rows in between slide over by one row to make room.
+  let to = r.from;
+  r.middles.forEach((middle, k) => {
+    if (k < r.from && pointer < middle && k < to) to = k;
+    if (k > r.from && pointer > middle) to = Math.max(to, k);
+  });
+  r.to = to;
+  r.rows.forEach((row, k) => {
+    if (k === r.from) return;
+    const offset = to < r.from && k >= to && k < r.from ? r.shift : to > r.from && k > r.from && k <= to ? -r.shift : 0;
+    row.style.transform = offset ? `translateY(${offset}px)` : "";
+  });
+}
+
+function endReorder(drop) {
+  if (!reorder) return;
+  const { from, to, rows, list, moved, frame } = reorder;
+  reorder = null;
+  cancelAnimationFrame(frame);
+  list.classList.remove("reordering");
+  rows.forEach(row => { row.classList.remove("moving"); row.style.transform = ""; });
+  if (!moved) return; // a click on the number selects the line, through the row's click
+  suppressRowClickUntil = performance.now() + 300;
+  if (drop && to !== from) moveLine(from, to);
 }
 
 // ---------------------------------------------------------------------------
