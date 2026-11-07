@@ -849,3 +849,183 @@ button:disabled {
     overflow: hidden;
   }
 }
+
+/* Short guide for first-time visitors. It can be closed and stays closed. */
+.steps {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  background: rgba(27,30,37,.94);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+}
+.steps ol {
+  flex: 1;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 18px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  counter-reset: step;
+  font-size: 13px;
+  color: #dfe3ef;
+}
+.steps li {
+  counter-increment: step;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.steps li::before {
+  content: counter(step);
+  display: inline-grid;
+  place-items: center;
+  flex: 0 0 auto;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: var(--accent);
+  color: #081024;
+  font-size: 11px;
+  font-weight: 800;
+}
+.steps .close {
+  min-height: 0;
+  padding: 2px 8px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 18px;
+  line-height: 1;
+}
+
+/* Column titles above the editable line lists */
+.list-head {
+  display: grid;
+  grid-template-columns: 28px 1fr 82px 82px;
+  gap: 6px;
+  padding: 0 7px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+/* Touch screens: stop the browser from scrolling while the subtitle, a selected line
+   or a line edge is being dragged. Unselected lines still let the timeline scroll. */
+.subtitle-overlay,
+.clip.selected,
+.clip .handle {
+  touch-action: none;
+}
+
+/* Wider line edges that a finger can grab */
+@media (pointer: coarse) {
+  .clip .handle {
+    width: 14px;
+  }
+}
+
+@media (max-width: 680px) {
+  .steps ol {
+    flex-direction: column;
+  }
+  .list-head {
+    grid-template-columns: 24px minmax(0,1fr) 74px 74px;
+  }
+}
+
+/* Dragging on the timeline should not select the lyric text */
+.timeline {
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* Optional settings that are folded away until needed */
+.more {
+  margin-top: 8px;
+  font-size: 12px;
+}
+.more summary {
+  color: var(--accent);
+  cursor: pointer;
+}
+.more .file {
+  margin: 8px 0 5px;
+}
+
+/* Tap along: a bar fixed to the bottom of the screen with one big button */
+.tap-bar {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 12px 18px;
+  background: rgba(17,19,24,.97);
+  border-top: 1px solid var(--line);
+  box-shadow: 0 -8px 24px rgba(0,0,0,.45);
+}
+body.tapping {
+  padding-bottom: 120px;
+}
+.tap-info {
+  flex: 1;
+  min-width: 0;
+}
+.tap-next {
+  margin-top: 3px;
+  font-size: 18px;
+  font-weight: 800;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tap-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.tap-button {
+  min-width: 240px;
+  min-height: 58px;
+  font-size: 16px;
+  touch-action: manipulation;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+}
+.tap-button.holding {
+  background: #ff858d;
+  color: #13161d;
+}
+.tap-speed select {
+  width: auto;
+  margin-left: 4px;
+}
+
+@media (max-width: 680px) {
+  .tap-bar {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+    padding: 10px;
+  }
+  body.tapping {
+    padding-bottom: 190px;
+  }
+  .tap-controls {
+    flex-wrap: wrap;
+  }
+  .tap-button {
+    flex: 1 1 100%;
+    min-height: 76px;
+  }
+  .tap-speed,
+  #tapStop {
+    flex: 1;
+  }
+}

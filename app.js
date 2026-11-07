@@ -1,25 +1,71 @@
-import { pipeline, env } from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1";
+// Lyrics Studio: a browser-only editor for timed lyrics.
+//
+// Everything runs on the user's device:
+// - AI timing: forced alignment of the known lyrics with Meta's MMS model (transformers.js,
+//   WebAssembly) in a background thread, see aligner-worker.js and align.js
+// - the timeline editor
+// - video export: the video and the subtitles are drawn on a canvas and recorded with
+//   MediaRecorder, then converted to MP4 with FFmpeg compiled to WebAssembly
 
-env.allowLocalModels = false; 
-env.useBrowserCache = true;
+import { tokenizeLines, ctcAlign, lineConfidence } from "./align.js";
 
-const MODEL = "onnx-community/whisper-base_timestamped";
-let transcriber = null, mediaFile = null, mediaUrl = null, blocks = [], selected = -1, selectionOverride = -1, selectionToken = 0, drag = null, timelineScale = 60;
-const style = { size: 36, color: "#ffffff", outline: "#000000", outlineWidth: 0, box: false, boxColor: "#000000", boxOpacity: 0.35 };
+const STORAGE_KEY = "lyricsStudio.session.v1";
+const STEPS_HIDDEN_KEY = "lyricsStudio.stepsHidden";
+// Size of the exported video when the source is an audio file (lyrics on a black background)
+const AUDIO_EXPORT_WIDTH = 1920, AUDIO_EXPORT_HEIGHT = 1080;
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+
+// Each block is one subtitle line: { text, start, end, x, y, size?, width? }.
+// start and end are in seconds; x and y are the centre of the text in % of the video frame.
+let blocks = [];
+let selected = -1;
+// While the video seeks to a line the user picked, keep that line selected instead of
+// the one that happens to be under the playhead during the seek.
+let selectionOverride = -1, selectionToken = 0;
+let drag = null;
+let timelineScale = 60; // pixels per second
+let mediaFile = null, mediaUrl = null;
+let savedMediaName = ""; // file name from a restored session or project, shown as a reminder
 let manualDraft = [], manualSelected = -1;
-const $ = id => document.getElementById(id), media = $("media"), lyrics = $("lyrics"), video = $("video"), overlay = $("overlay"), tracks = $("tracks");
+const style = { size: 36, color: "#ffffff", outline: "#000000", outlineWidth: 0, box: false, boxColor: "#000000", boxOpacity: 0.35 };
+
+const $ = id => document.getElementById(id);
+const media = $("media"), lyrics = $("lyrics"), video = $("video"), overlay = $("overlay"), tracks = $("tracks");
+const timelineBox = document.querySelector(".timeline");
+
+// ---------------------------------------------------------------------------
+// Small helpers
+// ---------------------------------------------------------------------------
 
 const fmt = t => { t = Math.max(0, Number(t) || 0); return `${String(Math.floor(t / 60)).padStart(2, "0")}:${(t % 60).toFixed(2).padStart(5, "0")}`; };
-const normArmenian = s => s.toLowerCase().replace(/[^\u0531-\u058F\u0561-\u0587a-z0-9]/gi, " ").replace(/\s+/g, " ").trim();
-const getWords = s => normArmenian(s).split(" ").filter(Boolean);
+
+// The lyric lines from the Lyrics box. Section tags such as "[Chorus]" (common in lyrics from AI
+// song tools) are not sung, so they are skipped.
+const lyricLines = () => lyrics.value.split(/\r?\n/).map(line => line.trim()).filter(line => line && !/^\[[^\]]*\]$/.test(line));
+const shorten = (s, n = 40) => { s = String(s).replace(/\s+/g, " ").trim(); return s.length > n ? s.slice(0, n - 1) + "…" : s; };
+const baseName = name => String(name || "").replace(/\.[^.]+$/, "").trim() || "lyrics";
+
+function storageGet(key) {
+  try { return localStorage.getItem(key); } catch { return null; }
+}
+
+function storageSet(key, value) {
+  try { localStorage.setItem(key, value); return true; } catch { return false; } // storage full or disabled
+}
 
 function status(text, percent = null) {
   $("status").textContent = text;
   if (percent !== null) $("progress").style.width = Math.max(0, Math.min(100, percent)) + "%";
 }
 
+// Length of the song: the media duration, or the end of the last line if no media is loaded yet.
 function duration() {
-  return Number.isFinite(video.duration) && video.duration > 0 ? video.duration : (blocks.at(-1)?.end || 60);
+  if (Number.isFinite(video.duration) && video.duration > 0) return video.duration;
+  const ends = blocks.map(b => b.end).filter(Number.isFinite);
+  return ends.length ? Math.max(...ends) : 60;
 }
 
 function clampBlock(b) {
@@ -35,6 +81,7 @@ function clampBlock(b) {
   b.y = Math.min(88, Math.max(12, b.y));
 }
 
+// Sorts the lines by time and removes overlaps, keeping every line at least a short moment long.
 function normalizeBlocks() {
   if (!blocks.length) return;
   blocks.sort((a, b) => a.start - b.start);
@@ -53,213 +100,195 @@ function normalizeBlocks() {
   }
 }
 
-// 1. BANDPASS AUDIO FILTER: Isolates vocal frequencies (180Hz - 3800Hz) from song backing tracks
-async function extractMono16kFiltered(file) {
-  status("Isolating vocals & pre-filtering audio track...", 10);
-  try {
-    const decoder = new AudioContext();
-    try {
-      const decoded = await decoder.decodeAudioData(await file.arrayBuffer());
-      if (!decoded || !decoded.length) throw Error("No audio samples were decoded.");
-      const offline = new OfflineAudioContext(1, Math.ceil(decoded.duration * 16000), 16000);
-      const mono = offline.createBuffer(1, decoded.length, decoded.sampleRate), md = mono.getChannelData(0);
-      for (let i = 0; i < decoded.length; i++) {
-        let v = 0;
-        for (let ch = 0; ch < decoded.numberOfChannels; ch++) v += decoded.getChannelData(ch)[i];
-        md[i] = v / decoded.numberOfChannels;
-      }
-      const source = offline.createBufferSource(), highpass = offline.createBiquadFilter(), lowpass = offline.createBiquadFilter();
-      source.buffer = mono;
-      highpass.type = "highpass";
-      highpass.frequency.value = 180;
-      lowpass.type = "lowpass";
-      lowpass.frequency.value = 3800;
-      source.connect(highpass);
-      highpass.connect(lowpass);
-      lowpass.connect(offline.destination);
-      source.start();
-      const rendered = await offline.startRendering();
-      return { pcm: rendered.getChannelData(0), sampleRate: 16000 };
-    } finally {
-      await decoder.close();
-    }
-  } catch (nativeError) {
-    console.warn("Native audio decoding failed; using FFmpeg fallback.", nativeError);
-    status("Preparing audio decoder fallback...", 12);
-    const encoder = await loadFFmpeg();
-    const inputName = "timing-source" + (file.name.match(/\.[a-z0-9]+$/i)?.[0] || ".mp4");
-    await encoder.writeFile(inputName, new Uint8Array(await file.arrayBuffer()));
-    await encoder.exec(["-i", inputName, "-vn", "-ac", "1", "-ar", "16000", "-af", "highpass=f=180,lowpass=f=3800", "-f", "f32le", "timing-audio.pcm"]);
-    const data = await encoder.readFile("timing-audio.pcm");
-    if (typeof data === "string" || !data.length) throw Error("The selected file has no decodable audio track.");
-    const pcm = new Float32Array(data.buffer, data.byteOffset, Math.floor(data.byteLength / Float32Array.BYTES_PER_ELEMENT));
-    return { pcm: new Float32Array(pcm), sampleRate: 16000 };
-  }
-}
-
-// 2. ENERGY VAD ENGINE: Calculates RMS audio energy to find exact voice activation points
-function computeEnergyProfile(pcm, sampleRate = 16000, frameMs = 30) {
-  const frameSize = Math.floor(sampleRate * (frameMs / 1000));
-  const numFrames = Math.floor(pcm.length / frameSize);
-  const energy = new Float32Array(numFrames);
-  let maxE = 0;
-
-  for (let i = 0; i < numFrames; i++) {
-    let sum = 0;
-    for (let j = 0; j < frameSize; j++) {
-      const val = pcm[i * frameSize + j];
-      sum += val * val;
-    }
-    const rms = Math.sqrt(sum / frameSize);
-    energy[i] = rms;
-    if (rms > maxE) maxE = rms;
-  }
-
-  return { energy, frameMs, maxE: maxE || 1 };
-}
-
-function findVocalBoundary(timeSec, { energy, frameMs, maxE }, searchDir = "start", windowSec = 1.2) {
-  const frameIdx = Math.floor((timeSec * 1000) / frameMs);
-  const windowFrames = Math.floor((windowSec * 1000) / frameMs);
-  const threshold = maxE * 0.12;
-
-  if (searchDir === "start") {
-    for (let f = Math.max(0, frameIdx - windowFrames); f <= Math.min(energy.length - 1, frameIdx + windowFrames); f++) {
-      if (energy[f] >= threshold) return (f * frameMs) / 1000;
-    }
-  } else {
-    for (let f = Math.min(energy.length - 1, frameIdx + windowFrames); f >= Math.max(0, frameIdx - windowFrames); f--) {
-      if (energy[f] >= threshold) return ((f + 1) * frameMs) / 1000;
-    }
-  }
-  return timeSec;
-}
-
-function tokenSimilarity(expected, recognized) {
-  if (!expected || !recognized) return 0;
-  if (expected === recognized) return 1;
-  if (expected.startsWith(recognized) || recognized.startsWith(expected)) return .78;
-  const rows = Array.from({ length: expected.length + 1 }, (_, i) => i);
-  for (let i = 1; i <= expected.length; i++) {
-    let previous = rows[0];
-    rows[0] = i;
-    for (let j = 1; j <= recognized.length; j++) {
-      const saved = rows[j];
-      rows[j] = Math.min(
-        rows[j] + 1,
-        rows[j - 1] + 1,
-        previous + (expected[i - 1] === recognized[j - 1] ? 0 : 1)
-      );
-      previous = saved;
-    }
-  }
-  return Math.max(0, 1 - rows[recognized.length] / Math.max(expected.length, recognized.length));
-}
-
-function scoreLyricWindow(expectedWords, recognizedWords) {
-  const rows = Array.from({ length: expectedWords.length + 1 }, () => Array(recognizedWords.length + 1).fill(0));
-  for (let i = 1; i <= expectedWords.length; i++) rows[i][0] = rows[i - 1][0] - .75;
-  for (let j = 1; j <= recognizedWords.length; j++) rows[0][j] = rows[0][j - 1] - .28;
-  for (let i = 1; i <= expectedWords.length; i++) {
-    for (let j = 1; j <= recognizedWords.length; j++) {
-      const match = tokenSimilarity(expectedWords[i - 1], recognizedWords[j - 1]);
-      rows[i][j] = Math.max(
-        rows[i - 1][j - 1] + match * 2 - .75,
-        rows[i - 1][j] - .75,
-        rows[i][j - 1] - .28
-      );
-    }
-  }
-  return rows.at(-1).at(-1);
-}
-
-// Monotonic line aligner: weak recognitions are allowed to be skipped instead
-// of forcing the rest of the song onto the wrong timestamps.
-function alignArmenianLyrics(lines, detectedWords, energyProfile) {
-  if (!detectedWords.length) return [];
-  const matches = new Array(lines.length).fill(null);
-  let cursor = 0;
-
-  lines.forEach((lineText, lineIndex) => {
-    const expected = getWords(lineText);
-    if (!expected.length || cursor >= detectedWords.length) return;
-    const minimum = Math.max(1, expected.length - 2);
-    const maximum = Math.min(detectedWords.length - cursor, expected.length + 5);
-    let best = null;
-
-    for (let start = cursor; start < detectedWords.length; start++) {
-      for (let length = minimum; length <= maximum && start + length <= detectedWords.length; length++) {
-        const observed = detectedWords.slice(start, start + length).map(word => normArmenian(word.w));
-        const score = scoreLyricWindow(expected, observed) - Math.max(0, start - cursor) * .035;
-        if (!best || score > best.score) best = { start, end: start + length - 1, score };
-      }
-    }
-
-    const confidence = best && best.score / Math.max(1, expected.length) >= .12;
-    if (confidence) {
-      const first = detectedWords[best.start], last = detectedWords[best.end];
-      const start = findVocalBoundary(first.start, energyProfile, "start");
-      const end = findVocalBoundary(last.end, energyProfile, "end");
-      matches[lineIndex] = { start, end: Math.max(start + .35, end) };
-      cursor = best.end + 1;
-    }
+// Turns lines from a project file or the autosave into valid blocks. Unlike clampBlock it does not
+// limit the times to the current media, because the song may not be loaded yet.
+function sanitizeBlocks(list) {
+  if (!Array.isArray(list)) return [];
+  const number = value => (value === null || value === "" || value === undefined ? NaN : Number(value));
+  return list.filter(b => b && typeof b === "object").map(b => {
+    const start = Math.max(0, number(b.start) || 0);
+    const end = number(b.end) > start ? number(b.end) : start + 1.5;
+    const x = Number.isFinite(number(b.x)) ? number(b.x) : 50;
+    const y = Number.isFinite(number(b.y)) ? number(b.y) : 86;
+    const block = { text: String(b.text ?? ""), start, end, x: Math.min(85, Math.max(15, x)), y: Math.min(88, Math.max(12, y)) };
+    if (Number.isFinite(number(b.size))) block.size = Math.min(160, Math.max(12, number(b.size)));
+    if (Number.isFinite(number(b.width))) block.width = Math.min(100, Math.max(20, number(b.width)));
+    return block;
   });
-
-  const totalDuration = Math.max(
-    duration(),
-    detectedWords.at(-1)?.end || 0,
-    matches.filter(Boolean).at(-1)?.end || 0
-  );
-  const result = [];
-  let index = 0;
-  while (index < lines.length) {
-    if (matches[index]) {
-      result.push({ text: lines[index], ...matches[index], x: 50, y: 86 });
-      index++;
-      continue;
-    }
-    const runStart = index;
-    while (index < lines.length && !matches[index]) index++;
-    const previousEnd = runStart ? result.at(-1)?.end || 0 : 0;
-    const nextStart = index < lines.length ? matches[index].start : totalDuration;
-    const slot = Math.max(.35, (nextStart - previousEnd) / Math.max(1, index - runStart));
-    for (let j = runStart; j < index; j++) {
-      const start = previousEnd + (j - runStart) * slot;
-      result.push({ text: lines[j], start, end: Math.min(totalDuration, start + slot), x: 50, y: 86 });
-    }
-  }
-  return result;
 }
 
-// GUI AND EVENT HANDLERS
-media.onchange = () => {
-  mediaFile = media.files?.[0] || null;
-  if (!mediaFile) return;
-  if (mediaUrl) URL.revokeObjectURL(mediaUrl);
-  mediaUrl = URL.createObjectURL(mediaFile);
-  if (mediaFile.type.startsWith("video/")) {
-    video.src = mediaUrl;
-    video.classList.remove("hidden");
-    $("emptyStage").classList.add("hidden");
-    video.onloadedmetadata = () => {
-      video.style.objectFit = 'contain';
-      video.style.width = '100%';
-      video.style.height = '100%';
-      $("videoWrap").style.aspectRatio = 'auto';
-      blocks.forEach(clampBlock);
-      renderAll();
-    };
-  } else {
-    $("emptyStage").textContent = "Audio loaded. Timing editor is ready.";
-    video.classList.add("hidden");
-    $("emptyStage").classList.remove("hidden");
+function escapeHtml(s) { return String(s).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&#39;"); }
+
+function hexToRgb(hex) {
+  const clean = hex.replace('#', '');
+  const full = clean.length === 3 ? clean.split('').map(c => c + c).join('') : clean;
+  const num = parseInt(full, 16);
+  return `${(num >> 16) & 255}, ${(num >> 8) & 255}, ${num & 255}`;
+}
+
+// ---------------------------------------------------------------------------
+// Undo and redo
+// ---------------------------------------------------------------------------
+
+// Every change to the lines first saves the previous lines here, so it can be undone.
+const undoStack = [], redoStack = [];
+const snapshot = () => JSON.stringify(blocks);
+
+function pushUndo(state = snapshot()) {
+  if (undoStack.at(-1) === state) return;
+  undoStack.push(state);
+  if (undoStack.length > 100) undoStack.shift();
+  redoStack.length = 0;
+  updateUndoButtons();
+}
+
+function restoreBlocks(state) {
+  blocks = JSON.parse(state);
+  if (selected >= blocks.length) selected = blocks.length - 1;
+  renderAll();
+}
+
+function undo() {
+  const current = snapshot();
+  // A saved state can equal the current one, for example when a field got focus but was not changed.
+  while (undoStack.length && undoStack.at(-1) === current) undoStack.pop();
+  if (!undoStack.length) { updateUndoButtons(); return status("Nothing to undo."); }
+  redoStack.push(current);
+  restoreBlocks(undoStack.pop());
+  updateUndoButtons();
+  status("Undone. Press Redo to go forward again.");
+}
+
+function redo() {
+  if (!redoStack.length) return status("Nothing to redo.");
+  undoStack.push(snapshot());
+  restoreBlocks(redoStack.pop());
+  updateUndoButtons();
+  status("Redone.");
+}
+
+function updateUndoButtons() {
+  $("undo").disabled = !undoStack.length;
+  $("redo").disabled = !redoStack.length;
+}
+
+$("undo").onclick = undo;
+$("redo").onclick = redo;
+
+// Text and number fields: remember the lines when a field gets focus and save them as an undo
+// step on the first change, so one Undo reverts the whole edit of that field.
+let fieldSnapshot = null;
+document.addEventListener("focusin", e => {
+  fieldSnapshot = e.target.matches?.("input, textarea") && e.target.closest("#inspector, #editBlockList") ? snapshot() : null;
+});
+document.addEventListener("input", e => {
+  if (fieldSnapshot && e.target.closest?.("#inspector, #editBlockList")) {
+    pushUndo(fieldSnapshot);
+    fieldSnapshot = null;
   }
+}, true);
+
+// Asks before AI timing or Split evenly replaces lines the user may have corrected by hand.
+function confirmReplace() {
+  return !blocks.length || confirm(`This replaces your ${blocks.length} timed lines. You can undo it afterwards. Continue?`);
+}
+
+// ---------------------------------------------------------------------------
+// Loading the video or song
+// ---------------------------------------------------------------------------
+
+media.onchange = () => {
+  const file = media.files?.[0];
+  if (file) loadMedia(file);
 };
+
+// Optional vocals-only file (for example a stem from Suno). AI timing listens to it instead of the
+// full song, because music under the voice is the main reason timing goes wrong.
+let vocalsFile = null;
+$("vocals").onchange = () => {
+  vocalsFile = $("vocals").files?.[0] || null;
+  if (vocalsFile) status(`AI timing will listen to "${vocalsFile.name}". The video keeps the full song.`);
+};
+
+function loadMedia(file) {
+  // A vocals file from the previous song would time the wrong song.
+  const clearedVocals = Boolean(vocalsFile);
+  if (clearedVocals) {
+    vocalsFile = null;
+    $("vocals").value = "";
+  }
+  mediaFile = file;
+  savedMediaName = file.name;
+  if (mediaUrl) URL.revokeObjectURL(mediaUrl);
+  mediaUrl = URL.createObjectURL(file);
+  const isAudio = file.type.startsWith("audio/") || /\.(mp3|wav|m4a|aac|ogg|oga|opus|flac)$/i.test(file.name);
+  // A <video> element plays audio files too. For a song without video, the preview shows the
+  // lyrics on black, the same way the exported video will look.
+  video.src = mediaUrl;
+  video.classList.remove("hidden");
+  $("emptyStage").classList.add("hidden");
+  $("videoWrap").classList.toggle("audio-only", isAudio);
+  status(`Loading ${file.name}...`);
+  video.onloadedmetadata = () => {
+    $("videoWrap").style.aspectRatio = video.videoWidth ? "auto" : "16 / 9";
+    blocks.forEach(clampBlock);
+    renderAll();
+    status((blocks.length
+      ? `${file.name} is ready. Your ${blocks.length} lines are on the timeline.`
+      : `${file.name} is ready (${fmt(video.duration)}). Paste the lyrics, then time them.`)
+      + (clearedVocals ? " The vocals-only file was cleared because the song changed." : ""));
+  };
+  video.onerror = () => status(`This browser cannot play ${file.name}. Try an MP4 video or an MP3 song.`, 0);
+}
 
 video.ontimeupdate = () => {
   renderPreview();
   updatePlayhead();
 };
+
+// timeupdate fires only about four times a second. While playing, redraw on every frame so the
+// subtitle changes exactly on time, which matters when checking the timing.
+function playbackLoop() {
+  if (video.paused || video.ended) return;
+  // While a line is held in Tap along, it stays on screen until the button is released.
+  if (tap?.holding) blocks[tap.order[tap.position]].end = video.currentTime + 0.05;
+  renderPreview();
+  updatePlayhead();
+  requestAnimationFrame(playbackLoop);
+}
+video.addEventListener("play", () => { updatePlayhead(); requestAnimationFrame(playbackLoop); });
+video.addEventListener("pause", updatePlayhead);
+
+function playVideo() {
+  if (!video.src) return status("Choose a video or audio file first.");
+  video.play().catch(err => status(`Playback could not start: ${err.message}`));
+}
+
+function togglePlay() {
+  if (!video.src) return status("Choose a video or audio file first.");
+  if (video.paused) playVideo(); else video.pause();
+}
+
+function seekBy(seconds) {
+  if (!video.src) return;
+  video.currentTime = Math.max(0, Math.min(duration(), video.currentTime + seconds));
+  updatePlayhead();
+}
+
+// On a phone the preview is far below the Source panel, so bring it into view after timing.
+function revealPreview() {
+  const r = $("videoWrap").getBoundingClientRect();
+  if (r.bottom < 0 || r.top > window.innerHeight) $("videoWrap").scrollIntoView({ behavior: "smooth", block: "center" });
+}
+
+function setTimingButtonsDisabled(disabled) {
+  $("generate").disabled = disabled;
+  $("manualTiming").disabled = disabled;
+}
+
+// ---------------------------------------------------------------------------
+// Split evenly: a draft that can be edited before it becomes the timeline
+// ---------------------------------------------------------------------------
 
 function createEvenlyTimedBlocks(lineTexts) {
   const total = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : duration();
@@ -274,6 +303,7 @@ function createEvenlyTimedBlocks(lineTexts) {
   }));
 }
 
+// Keeps the draft in order: every line starts after the previous one ends and lasts a little.
 function correctManualTiming(fromIndex = 0) {
   const total = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : duration();
   for (let i = Math.max(0, fromIndex); i < manualDraft.length; i++) {
@@ -293,22 +323,20 @@ function renderManualDraft() {
     editor.innerHTML = "";
     return;
   }
-  editor.innerHTML = `<div class="manual-editor">${manualDraft.map((b, i) => `<div class="manual-row${i === manualSelected ? " selected" : ""}" data-manual-row="${i}"><strong>${i + 1}</strong><textarea data-manual-text="${i}" aria-label="Text block ${i + 1}">${escapeHtml(b.text)}</textarea><input data-manual-start="${i}" type="text" inputmode="decimal" autocomplete="off" value="${b.start.toFixed(2)}" aria-label="Start time ${i + 1}"><input data-manual-end="${i}" type="text" inputmode="decimal" autocomplete="off" value="${b.end.toFixed(2)}" aria-label="End time ${i + 1}"></div>`).join("")}</div><div class="row" style="margin-top:9px"><button type="button" class="ghost grow" id="refreshManualTiming" ${manualSelected >= 0 && manualSelected < manualDraft.length - 1 ? "" : "disabled"}>Refresh following timings</button><button type="button" class="primary grow" id="manualNext">Next: create text blocks</button></div>`;
+  editor.innerHTML = `<div class="manual-editor"><div class="list-head"><span>#</span><span>Text</span><span>Start (s)</span><span>End (s)</span></div>${manualDraft.map((b, i) => `<div class="manual-row${i === manualSelected ? " selected" : ""}" data-manual-row="${i}"><strong>${i + 1}</strong><textarea data-manual-text="${i}" aria-label="Text of line ${i + 1}">${escapeHtml(b.text)}</textarea><input data-manual-start="${i}" type="text" inputmode="decimal" autocomplete="off" value="${b.start.toFixed(2)}" aria-label="Start time of line ${i + 1}"><input data-manual-end="${i}" type="text" inputmode="decimal" autocomplete="off" value="${b.end.toFixed(2)}" aria-label="End time of line ${i + 1}"></div>`).join("")}</div><div class="row" style="margin-top:9px"><button type="button" class="ghost grow" id="refreshManualTiming" ${manualSelected >= 0 && manualSelected < manualDraft.length - 1 ? "" : "disabled"}>Re-split the lines after the selected one</button><button type="button" class="primary grow" id="manualNext">Next: put the lines on the timeline</button></div>`;
+  const selectRow = row => {
+    manualSelected = Number(row.dataset.manualRow);
+    editor.querySelectorAll("[data-manual-row]").forEach(item => item.classList.toggle("selected", item === row));
+    $("refreshManualTiming").disabled = manualSelected < 0 || manualSelected >= manualDraft.length - 1;
+  };
   editor.querySelectorAll("[data-manual-row]").forEach(row => {
-    row.onclick = () => {
-      manualSelected = Number(row.dataset.manualRow);
-      editor.querySelectorAll("[data-manual-row]").forEach(item => item.classList.toggle("selected", item === row));
-      $("refreshManualTiming").disabled = manualSelected < 0 || manualSelected >= manualDraft.length - 1;
-    };
+    row.onclick = () => selectRow(row);
   });
   editor.querySelectorAll("input, textarea").forEach(input => {
     input.onclick = e => {
       e.stopPropagation();
       const row = e.target.closest("[data-manual-row]");
-      if (!row) return;
-      manualSelected = Number(row.dataset.manualRow);
-      editor.querySelectorAll("[data-manual-row]").forEach(item => item.classList.toggle("selected", item === row));
-      $("refreshManualTiming").disabled = manualSelected < 0 || manualSelected >= manualDraft.length - 1;
+      if (row) selectRow(row);
     };
   });
   editor.querySelectorAll("[data-manual-text]").forEach(input => {
@@ -320,6 +348,7 @@ function renderManualDraft() {
   editor.querySelectorAll("[data-manual-end]").forEach(input => {
     input.oninput = e => { manualDraft[Number(e.target.dataset.manualEnd)].end = Math.max(0, Number(e.target.value) || 0); };
   });
+  // Keeps the lines up to the selected one and splits the remaining time evenly among the rest.
   $("refreshManualTiming").onclick = () => {
     if (manualSelected < 0 || manualSelected >= manualDraft.length - 1) return;
     correctManualTiming(0);
@@ -332,49 +361,172 @@ function renderManualDraft() {
     }
     correctManualTiming(manualSelected + 1);
     renderManualDraft();
-    status(`Refreshed timings after block ${manualSelected + 1}. Earlier timings were preserved.`, 100);
+    status(`Re-split the lines after line ${manualSelected + 1}. Earlier lines were kept.`, 100);
   };
   $("manualNext").onclick = () => {
     correctManualTiming();
     const valid = manualDraft.every(b => b.text.trim() && b.end > b.start);
-    if (!valid) return status("Each text block needs text and an end time greater than its start time.");
+    if (!valid) return status("Each line needs text and an end time after its start time.");
+    pushUndo();
     blocks = manualDraft.map(b => ({ ...b, text: b.text.trim() }));
     manualDraft = [];
     normalizeBlocks();
     selected = blocks.length ? 0 : -1;
     renderManualDraft();
     renderAll();
-    status(`Created ${blocks.length} manual text blocks.`, 100);
+    revealPreview();
+    status(`Put ${blocks.length} lines on the timeline. Play the video and drag any line that is off.`, 100);
   };
 }
 
 $("manualTiming").onclick = () => {
-  const lineTexts = lyrics.value.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+  const lineTexts = lyricLines();
   if (!mediaFile) return status("Choose a video or audio file first.");
   if (!lineTexts.length) return status("Paste the lyrics first.");
-  if (!Number.isFinite(video.duration) || video.duration <= 0) return status("Wait for the media duration to load, then try again.");
+  if (!Number.isFinite(video.duration) || video.duration <= 0) return status("Wait a moment until the file has loaded, then try again.");
+  if (!confirmReplace()) return;
   try {
     manualDraft = createEvenlyTimedBlocks(lineTexts);
     manualSelected = -1;
     renderManualDraft();
-    status(`Prepared ${manualDraft.length} text blocks. Check the text and timings, then click Next.`, 100);
+    status(`Split the song into ${manualDraft.length} equal lines. Check the text and times below, then click Next.`, 100);
   } catch (err) {
     console.error(err);
-    status(`Manual timing error: ${err.message}`, 0);
+    status(`Could not split the lines: ${err.message}`, 0);
   }
 };
 
+// ---------------------------------------------------------------------------
+// Tap along: hold a button (or Space) while each line is sung
+// ---------------------------------------------------------------------------
+
+// People press and let go a little after they hear the change, so both times move back this much.
+const TAP_REACTION_SECONDS = 0.15;
+// While tapping: the lines in time order, the one being timed, and the lines not timed yet
+// (hidden from the preview so old times do not flash up).
+let tap = null; // { order, position, holding, pending: Set of block indices }
+
+function startTapAlong() {
+  if (!mediaFile) return status("Choose a video or audio file first.");
+  if (!Number.isFinite(video.duration) || video.duration <= 0) return status("Wait a moment until the file has loaded, then try again.");
+  const lineTexts = lyricLines();
+  const sameLines = blocks.length && lineTexts.join("\n") === sortedBlockIndices().map(i => blocks[i].text).join("\n");
+  if (!sameLines) {
+    // Start from the Lyrics box, like the other timing buttons.
+    if (!lineTexts.length) return status("Paste the lyrics first.");
+    if (!confirmReplace()) return;
+    pushUndo();
+    blocks = createEvenlyTimedBlocks(lineTexts);
+    selected = 0;
+  } else {
+    pushUndo();
+  }
+  manualDraft = [];
+  renderManualDraft();
+  const order = sortedBlockIndices();
+  // With existing lines, start at the selected line, so one part of the song can be redone.
+  const position = sameLines ? Math.max(0, order.indexOf(selected)) : 0;
+  tap = { order, position, holding: false, pending: new Set(order.slice(position)) };
+  video.playbackRate = Number($("tapSpeed").value) || 1;
+  video.currentTime = position === 0 ? 0 : Math.max(0, blocks[order[position]].start - 3);
+  document.activeElement?.blur?.();
+  document.body.classList.add("tapping");
+  $("tapBar").classList.remove("hidden");
+  renderAll();
+  updateTapBar();
+  playVideo();
+  status("Hold the button (or Space) while each line is sung, and let go when it ends. Stop or Esc ends tapping.");
+}
+
+function updateTapBar() {
+  if (!tap) return;
+  const b = blocks[tap.order[tap.position]];
+  $("tapProgress").textContent = `Line ${tap.position + 1} of ${tap.order.length}${tap.holding ? " · singing" : " · next"}`;
+  $("tapNext").textContent = b ? b.text : "";
+  $("tapButton").classList.toggle("holding", tap.holding);
+  $("tapButton").textContent = tap.holding ? "Let go when the line ends" : "Hold while the line is sung";
+}
+
+const tapTime = () => Math.max(0, video.currentTime - TAP_REACTION_SECONDS * video.playbackRate);
+
+function tapDown() {
+  if (!tap || tap.holding || tap.position >= tap.order.length) return;
+  if (video.paused) playVideo();
+  const index = tap.order[tap.position];
+  tap.holding = true;
+  tap.pending.delete(index);
+  blocks[index].start = tapTime();
+  blocks[index].end = video.currentTime + 0.05; // grows while the button is held (see playbackLoop)
+  updateTapBar();
+}
+
+function tapUp() {
+  if (!tap || !tap.holding) return;
+  const b = blocks[tap.order[tap.position]];
+  b.end = Math.max(b.start + 0.2, tapTime());
+  tap.holding = false;
+  tap.position++;
+  renderTimeline();
+  if (tap.position >= tap.order.length) finishTapAlong(true);
+  else updateTapBar();
+}
+
+function finishTapAlong(completed) {
+  if (!tap) return;
+  if (tap.holding) tapUp();
+  if (!tap) return; // tapUp finished the last line
+  const { order, position: timed } = tap;
+  tap = null;
+  // Lines that were not tapped must stay after the tapped ones. If their earlier times are in the
+  // way, share the rest of the song evenly between them.
+  const rest = order.slice(timed);
+  const lastEnd = timed > 0 ? blocks[order[timed - 1]].end : 0;
+  if (rest.length && blocks[rest[0]].start < lastEnd) {
+    const slice = Math.max(0.3, (duration() - lastEnd) / rest.length);
+    rest.forEach((index, k) => {
+      blocks[index].start = lastEnd + k * slice;
+      blocks[index].end = lastEnd + (k + 1) * slice;
+    });
+  }
+  video.pause();
+  video.playbackRate = 1;
+  document.body.classList.remove("tapping");
+  $("tapBar").classList.add("hidden");
+  normalizeBlocks();
+  renderAll();
+  status(completed
+    ? `All ${blocks.length} lines are timed. Play the video to check them, and drag any line that is a little off.`
+    : `Stopped after ${timed} lines. The lines you timed were kept; the others keep their earlier times.`);
+}
+
+$("tapAlong").onclick = startTapAlong;
+$("tapStop").onclick = () => finishTapAlong(false);
+$("tapSpeed").onchange = e => { if (tap) video.playbackRate = Number(e.target.value) || 1; };
+$("tapButton").onpointerdown = e => {
+  e.preventDefault(); // keeps focus and text selection away from the button
+  try { $("tapButton").setPointerCapture(e.pointerId); } catch { /* the pointer is already gone */ }
+  tapDown();
+};
+$("tapButton").onpointerup = $("tapButton").onpointercancel = () => tapUp();
+$("tapButton").oncontextmenu = e => e.preventDefault(); // a long press must not open a menu on phones
+video.addEventListener("ended", () => { if (tap) finishTapAlong(tap.position >= tap.order.length); });
+
+// ---------------------------------------------------------------------------
+// Preview: the subtitle drawn over the video
+// ---------------------------------------------------------------------------
+
+// Lines that are shown in the preview: all of them, except lines still waiting to be tapped.
+const isShown = index => !tap || !tap.pending.has(index);
+
 function activeBlock() {
-  return blocks.findIndex(b => video.currentTime >= b.start && video.currentTime < b.end);
+  return blocks.findIndex((b, index) => isShown(index) && video.currentTime >= b.start && video.currentTime < b.end);
 }
 
 function renderPreview() {
   const i = activeBlock();
-  
-  const selectedIsActive = selected >= 0 && blocks[selected] &&
+
+  const selectedIsActive = selected >= 0 && blocks[selected] && isShown(selected) &&
     video.currentTime >= blocks[selected].start - 0.01 && video.currentTime <= blocks[selected].end + 0.01;
-  const overrideIsActive = selectionOverride >= 0 && blocks[selectionOverride] &&
-    video.currentTime >= blocks[selectionOverride].start && video.currentTime < blocks[selectionOverride].end;
   if (selectionOverride >= 0 && blocks[selectionOverride]) {
     selected = selectionOverride;
   } else if (!selectedIsActive && i >= 0) {
@@ -383,17 +535,15 @@ function renderPreview() {
     renderBlocks();
   }
 
-  const active = blocks.filter(b => video.currentTime >= b.start && video.currentTime < b.end);
+  const active = blocks.filter((b, index) => isShown(index) && video.currentTime >= b.start && video.currentTime < b.end);
 
   if (!active.length) {
     overlay.classList.add("hidden");
-    const previewText = $("previewText");
-    if (previewText) previewText.value = "";
     return;
   }
 
   const selectedBlock = blocks[selected];
-  const selectedIsVisible = selectedBlock &&
+  const selectedIsVisible = selectedBlock && isShown(selected) &&
     video.currentTime >= selectedBlock.start - 0.01 && video.currentTime <= selectedBlock.end + 0.01;
   const b = selectedIsVisible ? selectedBlock : active[0];
   if (selectionOverride < 0 && b !== blocks[selected]) {
@@ -411,23 +561,17 @@ function renderPreview() {
   overlay.style.maxWidth = `${b.width ?? 80}%`;
   overlay.style.color = style.color;
   overlay.style.webkitTextStroke = `${style.outlineWidth}px ${style.outline}`;
-  
+
   const boxBackground = style.box ? `rgba(${hexToRgb(style.boxColor)}, ${style.boxOpacity})` : "transparent";
   overlay.style.background = boxBackground;
   overlay.style.padding = style.box ? "6px 12px" : "0";
   overlay.style.boxShadow = style.box ? `0 0 0 1px ${style.boxColor}66 inset` : "none";
-  
+
   overlay.classList.remove("hidden");
   overlay.classList.toggle("selected", selected >= 0 && b === blocks[selected]);
 }
 
-function hexToRgb(hex) {
-  const clean = hex.replace('#', '');
-  const full = clean.length === 3 ? clean.split('').map(c => c + c).join('') : clean;
-  const num = parseInt(full, 16);
-  return `${(num >> 16) & 255}, ${(num >> 8) & 255}, ${num & 255}`;
-}
-
+// The area inside the preview that the video picture really covers (without black bars).
 function getMediaBounds() {
   const wrap = $("videoWrap").getBoundingClientRect();
   if (!video.classList.contains("hidden") && video.videoWidth && video.videoHeight) {
@@ -446,15 +590,20 @@ function getMediaBounds() {
   return wrap;
 }
 
+// Dragging the subtitle in the preview moves the selected line.
 overlay.onpointerdown = e => {
   if (selected < 0) return;
   e.preventDefault();
-  drag = { type: "position", startX: e.clientX, startY: e.clientY, x: blocks[selected].x, y: blocks[selected].y };
+  drag = { type: "position", startX: e.clientX, startY: e.clientY, x: blocks[selected].x, y: blocks[selected].y, moved: false, undo: snapshot() };
   overlay.setPointerCapture(e.pointerId);
 };
 
 overlay.onpointermove = e => {
   if (!drag || drag.type !== "position") return;
+  if (!drag.moved) {
+    drag.moved = true;
+    pushUndo(drag.undo);
+  }
   const r = getMediaBounds();
   blocks[selected].x = drag.x + ((e.clientX - drag.startX) / r.width) * 100;
   blocks[selected].y = drag.y + ((e.clientY - drag.startY) / r.height) * 100;
@@ -463,88 +612,226 @@ overlay.onpointermove = e => {
   renderInspector();
 };
 
-overlay.onpointerup = () => { drag = null; };
+overlay.onpointerup = overlay.onpointercancel = () => {
+  if (drag?.type === "position") drag = null;
+};
 
-// GENERATE TIMING MAIN FUNCTION
+// ---------------------------------------------------------------------------
+// Time with AI: forced alignment of the known lyrics (see align.js)
+// ---------------------------------------------------------------------------
+
+// Subtitles are easier to read when they appear a moment before the line is sung and stay a
+// little after it. Gaps shorter than GAP_CLOSE are closed so the text does not flicker.
+const LEAD = 0.15, TAIL = 0.5, GAP_CLOSE = 0.6;
+// Lines whose letters the model found less likely than this are reported as worth checking.
+const DOUBTFUL_CONFIDENCE = 0.3;
+
+// The model runs in aligner-worker.js. workerRequest sends one message and resolves with the
+// worker's "done" answer, passing progress messages to onProgress on the way.
+let alignerWorker = null;
+
+function workerRequest(message, onProgress) {
+  if (!alignerWorker) alignerWorker = new Worker(new URL("./aligner-worker.js", import.meta.url), { type: "module" });
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      alignerWorker.removeEventListener("message", onMessage);
+      alignerWorker.removeEventListener("error", onError);
+    };
+    const onMessage = ({ data }) => {
+      if (data.type === "progress") onProgress?.(data);
+      else if (data.type === "done") { cleanup(); resolve(data); }
+      else if (data.type === "error") { cleanup(); reject(Error(data.message)); }
+    };
+    const onError = e => {
+      cleanup();
+      alignerWorker = null; // start a fresh worker next time
+      reject(Error(e.message || "The timing model could not start."));
+    };
+    alignerWorker.addEventListener("message", onMessage);
+    alignerWorker.addEventListener("error", onError);
+    alignerWorker.postMessage(message);
+  });
+}
+
+// Downloads (the first time) and starts the model, showing the download progress.
+function loadAligner() {
+  const files = new Map();
+  status("Starting the timing model. The first time, it downloads about 300 MB...", 3);
+  return workerRequest({ type: "load" }, p => {
+    if (p.stage !== "download") return;
+    files.set(p.key, { loaded: Math.max(files.get(p.key)?.loaded || 0, p.loaded), total: p.total });
+    let loaded = 0, total = 0;
+    for (const f of files.values()) { loaded += f.loaded; total += f.total; }
+    status(`Downloading the timing model (first time only)... ${Math.round(loaded / 1048576)} of ${Math.round(total / 1048576)} MB`, 3 + 32 * loaded / total);
+  });
+}
+
+const minutesText = seconds => seconds < 90 ? "about a minute" : `about ${Math.round(seconds / 60)} minutes`;
+
+// Lets the model listen to the song and returns the letter probabilities for every 20 ms.
+function letterProbabilities(pcm) {
+  const started = performance.now();
+  status("Listening to the song. The first progress appears after a minute or two; you can keep using the page.", 40);
+  return workerRequest({ type: "run", pcm }, p => {
+    if (p.stage !== "listen") return;
+    const elapsed = (performance.now() - started) / 1000;
+    const left = p.done < 1 ? `, ${minutesText(elapsed * (1 - p.done) / p.done)} left` : "";
+    status(`Listening to the song... ${Math.round(p.done * 100)}%${left}`, 40 + 50 * p.done);
+  });
+}
+
+// Decodes the media file to 16 kHz mono audio, the format the timing model expects.
+async function extractMono16k(file) {
+  status("Preparing the audio...", 36);
+  try {
+    const decoder = new AudioContext();
+    try {
+      const decoded = await decoder.decodeAudioData(await file.arrayBuffer());
+      if (!decoded || !decoded.length) throw Error("No audio samples were decoded.");
+      // Rendering into a one-channel 16 kHz context mixes the channels and resamples.
+      const offline = new OfflineAudioContext(1, Math.ceil(decoded.duration * 16000), 16000);
+      const source = offline.createBufferSource();
+      source.buffer = decoded;
+      source.connect(offline.destination);
+      source.start();
+      return (await offline.startRendering()).getChannelData(0);
+    } finally {
+      await decoder.close();
+    }
+  } catch (nativeError) {
+    // Some formats cannot be decoded by the browser. FFmpeg can read almost anything.
+    console.warn("Native audio decoding failed; using FFmpeg fallback.", nativeError);
+    status("Preparing the audio with FFmpeg...", 36);
+    const encoder = await loadFFmpeg();
+    ffmpegJob = null;
+    const inputName = "timing-source" + (file.name.match(/\.[a-z0-9]+$/i)?.[0] || ".mp4");
+    await encoder.writeFile(inputName, new Uint8Array(await file.arrayBuffer()));
+    await encoder.exec(["-y", "-i", inputName, "-vn", "-ac", "1", "-ar", "16000", "-f", "f32le", "timing-audio.pcm"]);
+    const data = await encoder.readFile("timing-audio.pcm");
+    if (typeof data === "string" || !data.length) throw Error("The selected file has no audio track that can be read.");
+    return new Float32Array(data.buffer.slice(data.byteOffset, data.byteOffset + Math.floor(data.byteLength / 4) * 4));
+  }
+}
+
+// Turns the time of the first and last letter of each line into a subtitle line.
+function linesFromSpans(lines, ranges, spans, secondsPerFrame) {
+  const sung = lines.map((text, i) => ranges[i]
+    ? { text, start: spans[ranges[i][0]].start * secondsPerFrame, end: spans[ranges[i][1]].end * secondsPerFrame }
+    : { text, start: null, end: null });
+  // A line without letters (only numbers or symbols) goes right after the previous line.
+  sung.forEach((b, i) => {
+    if (b.start === null) { b.start = i ? sung[i - 1].end : 0; b.end = b.start + 1; }
+  });
+  const result = [];
+  sung.forEach((b, i) => {
+    const previousEnd = result.length ? result.at(-1).end : 0;
+    const nextShown = i + 1 < sung.length ? sung[i + 1].start - LEAD : duration();
+    const start = Math.max(previousEnd, b.start - LEAD);
+    let end = Math.min(nextShown, b.end + TAIL);
+    if (nextShown - end < GAP_CLOSE) end = nextShown;
+    result.push({ text: b.text, start, end: Math.max(end, start + 0.3), x: 50, y: 86 });
+  });
+  return result;
+}
+
 $("generate").onclick = async () => {
   if (!mediaFile) return status("Choose a video or audio file first.");
-  if (!lyrics.value.trim()) return status("Paste the lyrics first.");
-  $("generate").disabled = true;
+  const lines = lyricLines();
+  if (!lines.length) return status("Paste the lyrics first.");
+  const { tokens, ranges } = tokenizeLines(lines);
+  if (!tokens.length) return status("The lyrics have no letters that can be timed.");
+  if (!confirmReplace()) return;
+  setTimingButtonsDisabled(true);
 
   try {
-    if (!transcriber) {
-      status("Loading Whisper speech engine...", 15);
-      transcriber = await pipeline("automatic-speech-recognition", MODEL, { device: "wasm", dtype: "q8" });
-    }
-
+    await loadAligner();
     if (video.src && video.readyState < 1) {
       await new Promise(resolve => video.addEventListener("loadedmetadata", resolve, { once: true }));
     }
+    const pcm = await extractMono16k(vocalsFile || mediaFile);
+    const { logProbs, frames, vocabSize, secondsPerFrame } = await letterProbabilities(pcm);
 
-    const { pcm, sampleRate } = await extractMono16kFiltered(mediaFile);
-    const energyProfile = computeEnergyProfile(pcm, sampleRate);
+    status("Finding when each line is sung...", 92);
+    await new Promise(resolve => setTimeout(resolve, 30)); // let the status message appear
+    const spans = ctcAlign(logProbs, frames, vocabSize, tokens);
+    const newBlocks = linesFromSpans(lines, ranges, spans, secondsPerFrame);
+    const doubtful = lines.map((_, i) => i)
+      .filter(i => ranges[i] && lineConfidence(logProbs, vocabSize, tokens, spans, ranges[i]) < DOUBTFUL_CONFIDENCE)
+      .map(i => i + 1);
 
-    status("Transcribing Armenian vocals with prompt bias...", 50);
-
-    const lyricText = lyrics.value.trim();
-    const lyricLines = lyricText.split(/\n+/).map(x => x.trim()).filter(Boolean);
-
-    // 4. PROMPT INJECTION: Supply first ~250 chars of Armenian lyrics to Whisper prompt context
-    const promptContext = lyricText.slice(0, 250);
-
-    const opts = {
-      task: "transcribe",
-      language: "hy",
-      chunk_length_s: 30,
-      stride_length_s: 5,
-      return_timestamps: "word",
-      initial_prompt: promptContext
-    };
-
-    const result = await transcriber(pcm, opts);
-    
-    const detectedWords = (result.chunks || [])
-      .map(c => ({ w: c.text, start: Number(c.timestamp?.[0]), end: Number(c.timestamp?.[1]) }))
-      .filter(x => x.w && Number.isFinite(x.start) && Number.isFinite(x.end));
-
-    status("Aligning lyrics with DP matrix & VAD energy...", 80);
-
-    blocks = alignArmenianLyrics(lyricLines, detectedWords, energyProfile);
-
-    if (blocks.length) {
-      blocks[0].start = 0;
-      normalizeBlocks();
-    }
-
-    selected = 0;
+    pushUndo();
+    blocks = newBlocks;
+    normalizeBlocks();
+    selected = blocks.length ? 0 : -1;
     renderAll();
-    status(`Successfully generated Armenian timing for ${blocks.length} blocks!`, 100);
-
+    revealPreview();
+    const list = doubtful.slice(0, 8).join(", ") + (doubtful.length > 8 ? " and more" : "");
+    status(`Timed ${blocks.length} lines. ` + (doubtful.length
+      ? `The AI was not sure about line${doubtful.length > 1 ? "s" : ""} ${list}, so check ${doubtful.length > 1 ? "those" : "it"} first.`
+      : "Play the video to check them, and drag any line that is off."), 100);
   } catch (err) {
     console.error(err);
     status(`Error: ${err.message}`, 0);
   } finally {
-    $("generate").disabled = false;
+    setTimingButtonsDisabled(false);
   }
 };
 
+// ---------------------------------------------------------------------------
+// Editing panels
+// ---------------------------------------------------------------------------
+
 function renderInspector() {
   const box = $("inspector"), b = blocks[selected];
-  if (!b) { box.innerHTML = '<div class="hint">Select a block from timeline or list to inspect.</div>'; return; }
-  box.innerHTML = `<div class="field"><label>Text</label><textarea id="editText" class="lyrics" style="height:70px">${escapeHtml(b.text)}</textarea></div><div class="editor-row"><label>Text size<input id="editSize" type="number" min="12" max="160" value="${b.size ?? style.size}"></label><label>Window width (%)<input id="editWidth" type="number" min="20" max="100" value="${b.width ?? 80}"></label></div><div class="editor-row" style="margin-top:8px"><label>Start (s)<input id="editStart" type="number" step=".01" value="${b.start.toFixed(2)}"></label><label>End (s)<input id="editEnd" type="number" step=".01" value="${b.end.toFixed(2)}"></label></div><div class="row" style="margin-top:8px"><button class="ghost" id="setStart">Set start here</button><button class="ghost" id="setEnd">Set end here</button></div><div class="field" style="margin-top:14px"><label>Position <span class="hint">X ${Math.round(b.x)}% · Y ${Math.round(b.y)}%</span></label><input id="posX" class="range" type="range" min="5" max="95" value="${b.x}"><input id="posY" class="range" type="range" min="5" max="95" value="${b.y}"></div><button class="danger" id="deleteSelected" style="width:100%">Delete block</button>`;
+  if (!b) { box.innerHTML = '<div class="hint">Select a line on the timeline or in the list to edit it.</div>'; return; }
+  box.innerHTML = `<div class="field"><label for="editText">Text</label><textarea id="editText" class="lyrics" style="height:70px">${escapeHtml(b.text)}</textarea></div><div class="editor-row"><label>Text size<input id="editSize" type="number" min="12" max="160" value="${b.size ?? style.size}"></label><label>Line width (%)<input id="editWidth" type="number" min="20" max="100" value="${b.width ?? 80}"></label></div><div class="editor-row" style="margin-top:8px"><label>Start (s)<input id="editStart" type="number" step=".01" value="${b.start.toFixed(2)}"></label><label>End (s)<input id="editEnd" type="number" step=".01" value="${b.end.toFixed(2)}"></label></div><div class="row" style="margin-top:8px"><button type="button" class="ghost" id="setStart">Start here</button><button type="button" class="ghost" id="setEnd">End here</button></div><div class="hint" style="margin-top:5px">"Here" means the current video position.</div><div class="field" style="margin-top:14px"><label>Position <span class="hint">X ${Math.round(b.x)}% · Y ${Math.round(b.y)}%</span></label><input id="posX" class="range" type="range" min="5" max="95" value="${b.x}" aria-label="Horizontal position"><input id="posY" class="range" type="range" min="5" max="95" value="${b.y}" aria-label="Vertical position"></div><button type="button" class="danger" id="deleteSelected" style="width:100%">Delete line</button>`;
   $("editText").oninput = e => { b.text = e.target.value; renderPreview(); renderBlocks(); renderTimeline(); };
   $("editSize").oninput = e => { b.size = Math.max(12, Math.min(160, Number(e.target.value) || style.size)); renderPreview(); };
   $("editWidth").oninput = e => { b.width = Math.max(20, Math.min(100, Number(e.target.value) || 80)); renderPreview(); };
   $("editStart").oninput = e => { b.start = +e.target.value; clampBlock(b); renderTimeline(); };
   $("editEnd").oninput = e => { b.end = +e.target.value; clampBlock(b); renderTimeline(); };
-  $("setStart").onclick = () => { b.start = video.currentTime; clampBlock(b); renderInspector(); renderTimeline(); };
-  $("setEnd").onclick = () => { b.end = video.currentTime; clampBlock(b); renderInspector(); renderTimeline(); };
+  $("setStart").onclick = () => { pushUndo(); b.start = video.currentTime; clampBlock(b); renderInspector(); renderTimeline(); };
+  $("setEnd").onclick = () => { pushUndo(); b.end = video.currentTime; clampBlock(b); renderInspector(); renderTimeline(); };
   $("posX").oninput = e => { b.x = +e.target.value; renderPreview(); };
   $("posY").oninput = e => { b.y = +e.target.value; renderPreview(); };
-  $("deleteSelected").onclick = () => { blocks.splice(selected, 1); selected = -1; renderAll(); };
+  $("deleteSelected").onclick = () => deleteBlock(selected);
 }
 
-function escapeHtml(s) { return String(s).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;"); }
+function deleteBlock(index) {
+  const b = blocks[index];
+  if (!b) return;
+  pushUndo();
+  blocks.splice(index, 1);
+  selected = -1;
+  renderAll();
+  status(`Deleted "${shorten(b.text)}". Press Undo to bring it back.`);
+}
+
+// Splits the text of a line in two: by lines if it has several, otherwise by words.
+function splitText(text) {
+  const parts = text.split("\n");
+  if (parts.length > 1) {
+    const half = Math.ceil(parts.length / 2);
+    return [parts.slice(0, half).join("\n"), parts.slice(half).join("\n")];
+  }
+  const words = text.trim().split(/\s+/);
+  if (words.length < 2) return [text, text];
+  const half = Math.ceil(words.length / 2);
+  return [words.slice(0, half).join(" "), words.slice(half).join(" ")];
+}
+
+// Cuts a line in the middle of its time and gives each half part of the text.
+function splitBlock(index) {
+  const b = blocks[index];
+  if (!b) return;
+  pushUndo();
+  const middle = (b.start + b.end) / 2;
+  const [firstText, secondText] = splitText(b.text);
+  blocks.splice(index, 1, { ...b, text: firstText, end: middle }, { ...b, text: secondText, start: middle });
+  selected = index;
+  renderAll();
+  status("Split the line in two. Drag the edges on the timeline to adjust.");
+}
 
 function selectBlock(i, seek = true) {
   if (!blocks[i]) return;
@@ -569,28 +856,39 @@ function sortedBlockIndices() {
     .map(entry => entry.index);
 }
 
+// Selects the previous (-1) or next (+1) line in time order.
+function stepBlock(direction) {
+  const order = sortedBlockIndices();
+  if (!order.length) return;
+  const position = order.indexOf(selected);
+  const next = position < 0 ? (direction > 0 ? 0 : order.length - 1) : position + direction;
+  if (next >= 0 && next < order.length) selectBlock(order[next], true);
+}
+
 function renderBlocks() {
   const box = $("blockList");
-  box.innerHTML = "";
+  box.innerHTML = blocks.length ? "" : '<div class="hint" style="padding:13px">No lines yet.</div>';
   sortedBlockIndices().forEach((i, displayIndex) => {
     const b = blocks[i];
     const el = document.createElement("div");
     el.className = "block" + (i === selected ? " selected" : "");
-    el.innerHTML = `<div class="block-top"><span>#${displayIndex + 1}</span><span>${fmt(b.start)} → ${fmt(b.end)}</span></div><div class="block-text">${escapeHtml(b.text)}</div><div class="block-actions"><button class="ghost" data-play>Play line</button><button class="ghost" data-split>Split</button></div>`;
+    el.innerHTML = `<div class="block-top"><span>#${displayIndex + 1}</span><span>${fmt(b.start)} → ${fmt(b.end)}</span></div><div class="block-text">${escapeHtml(b.text)}</div><div class="block-actions"><button type="button" class="ghost" data-play>Play line</button><button type="button" class="ghost" data-split>Split</button></div>`;
     el.onclick = e => { if (e.target.tagName === "BUTTON") return; selectBlock(i, true); };
-    el.querySelector("[data-play]").onclick = () => { selectBlock(i, true); video.play(); };
-    el.querySelector("[data-split]").onclick = () => { const middle = (b.start + b.end) / 2; blocks.splice(i, 0, { ...b, end: middle }); blocks[i + 1].start = middle; selected = i; renderAll(); };
+    el.querySelector("[data-play]").onclick = () => { selectBlock(i, true); playVideo(); };
+    el.querySelector("[data-split]").onclick = () => splitBlock(i);
     box.appendChild(el);
   });
 }
 
 function renderEditBlocks() {
   const box = $("editBlockList");
-  box.innerHTML = "";
+  box.innerHTML = blocks.length
+    ? '<div class="list-head"><span>#</span><span>Text</span><span>Start (s)</span><span>End (s)</span></div>'
+    : '<div class="hint">No lines yet.</div>';
   sortedBlockIndices().forEach((i, displayIndex) => {
     const b = blocks[i], row = document.createElement("div");
     row.className = "edit-block-row" + (i === selected ? " selected" : "");
-    row.innerHTML = `<strong>${displayIndex + 1}</strong><textarea aria-label="Edit text block ${displayIndex + 1}">${escapeHtml(b.text)}</textarea><input type="text" inputmode="decimal" autocomplete="off" aria-label="Edit start time ${displayIndex + 1}" value="${b.start.toFixed(2)}"><input type="text" inputmode="decimal" autocomplete="off" aria-label="Edit end time ${displayIndex + 1}" value="${b.end.toFixed(2)}">`;
+    row.innerHTML = `<strong>${displayIndex + 1}</strong><textarea aria-label="Text of line ${displayIndex + 1}">${escapeHtml(b.text)}</textarea><input type="text" inputmode="decimal" autocomplete="off" aria-label="Start time of line ${displayIndex + 1}" value="${b.start.toFixed(2)}"><input type="text" inputmode="decimal" autocomplete="off" aria-label="End time of line ${displayIndex + 1}" value="${b.end.toFixed(2)}">`;
     const [textInput, startInput, endInput] = row.querySelectorAll("textarea, input");
     row.onclick = e => {
       if (e.target === textInput || e.target === startInput || e.target === endInput) return;
@@ -605,6 +903,24 @@ function renderEditBlocks() {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Timeline
+// ---------------------------------------------------------------------------
+
+// While playing, the timeline scrolls along so the playhead stays visible, except for a few
+// seconds after the user scrolls it themselves.
+let userScrolledTimelineAt = 0;
+["wheel", "touchstart", "pointerdown"].forEach(type =>
+  timelineBox.addEventListener(type, () => { userScrolledTimelineAt = performance.now(); }, { passive: true }));
+
+function followPlayhead() {
+  if (video.paused || drag || performance.now() - userScrolledTimelineAt < 3000) return;
+  const box = timelineBox.getBoundingClientRect(), head = $("playhead").getBoundingClientRect();
+  if (head.left < box.left + 90 || head.right > box.right - 30) {
+    timelineBox.scrollLeft += head.left - box.left - box.width * 0.25;
+  }
+}
+
 function updatePlayhead() {
   const d = Math.max(duration(), 0.01);
   const cur = video.currentTime || 0;
@@ -616,18 +932,19 @@ function updatePlayhead() {
   $("clock").textContent = fmt(cur);
   $("timelineReadout").textContent = `${fmt(cur)} / ${fmt(d)}`;
   $("timelinePlay").textContent = video.paused ? "Play" : "Pause";
+  followPlayhead();
 }
 
 function renderTimeline() {
-  const tracks = $("tracks"), ruler = $("ruler"), inner = $("timelineInner");
+  const ruler = $("ruler"), inner = $("timelineInner");
   tracks.querySelectorAll(".clip").forEach(x => x.remove());
   tracks.querySelectorAll(".track-row").forEach(x => x.remove());
   ruler.innerHTML = "";
   const d = Math.max(duration(), 0.01), width = Math.max(720, d * timelineScale);
   inner.style.width = width + "px";
-  
-  const minPixelBufferInSeconds = (14 / width) * d;
 
+  // Lines that touch or overlap go to different rows so both stay easy to grab.
+  const minPixelBufferInSeconds = (14 / width) * d;
   const laneEnds = [], laneMap = new Map();
   for (const block of [...blocks].sort((a, b) => a.start - b.start)) {
     let lane = 0;
@@ -636,7 +953,6 @@ function renderTimeline() {
     }
     laneEnds[lane] = block.end;
     laneMap.set(block, lane);
-    block.lane = lane;
   }
   const totalLanes = Math.max(1, laneEnds.length);
   tracks.style.minHeight = `${Math.max(90, totalLanes * 42 + 18)}px`;
@@ -658,15 +974,15 @@ function renderTimeline() {
   blocks.forEach((b, i) => {
     const lane = laneMap.get(b) || 0, row = rows[Math.min(lane, rows.length - 1)] || rows[0], el = document.createElement("div");
     el.className = "clip" + (i === selected ? " selected" : "");
+    el.dataset.index = i;
     el.style.left = (b.start / d * 100) + "%";
     el.style.width = Math.max((b.end - b.start) / d * 100, 0.2) + "%";
     el.textContent = b.text;
-    el.onclick = e => { if (e.target.classList.contains("handle")) return; selectBlock(i, true); };
-    el.onpointerdown = e => { if (e.target.classList.contains("handle")) return; selectBlock(i); drag = { type: "move", index: i, startX: e.clientX, start: b.start, end: b.end }; };
+    el.onpointerdown = e => startClipDrag(e, i, "move");
     ["left", "right"].forEach(side => {
       const h = document.createElement("i");
       h.className = "handle " + side;
-      h.onpointerdown = e => { e.stopPropagation(); drag = { type: side, index: i, startX: e.clientX, start: b.start, end: b.end }; };
+      h.onpointerdown = e => startClipDrag(e, i, side);
       el.appendChild(h);
     });
     row.appendChild(el);
@@ -676,23 +992,63 @@ function renderTimeline() {
 
 function renderAll() { renderBlocks(); renderEditBlocks(); renderInspector(); renderTimeline(); renderPreview(); }
 
+// A tap on a line selects it and jumps to its start. Dragging the line moves it; dragging an edge
+// changes its start or end. On touch screens only the selected line can be dragged (see the CSS),
+// so swiping over other lines still scrolls the timeline.
+let suppressClickUntil = 0;
+
+function startClipDrag(e, index, type) {
+  if (e.button > 0) return; // only the main mouse button, a finger or a pen
+  e.stopPropagation();
+  const b = blocks[index];
+  // A finger on a line that is not selected may be starting to scroll the timeline,
+  // so it can only select the line with a tap, not move it.
+  if (e.pointerType === "touch" && type === "move" && index !== selected) type = "tap";
+  drag = { type, index, startX: e.clientX, start: b.start, end: b.end, duration: duration(), moved: false, undo: snapshot() };
+  // Capture on the track area, which is not re-created during the drag, so every move reaches
+  // tracks.onpointermove, even when the pointer leaves the line.
+  try { tracks.setPointerCapture(e.pointerId); } catch { /* the pointer is already gone */ }
+}
+
 tracks.onpointermove = e => {
-  if (!drag) return;
-  const r = tracks.getBoundingClientRect(), delta = (e.clientX - drag.startX) / r.width * duration(), b = blocks[drag.index];
+  if (!drag || drag.type === "position" || drag.type === "tap") return;
+  const b = blocks[drag.index];
   if (!b) return;
+  if (!drag.moved) {
+    if (Math.abs(e.clientX - drag.startX) < 4) return; // a small wobble is still a tap
+    drag.moved = true;
+    pushUndo(drag.undo);
+    selected = drag.index;
+  }
+  const d = drag.duration;
+  const r = tracks.getBoundingClientRect(), delta = (e.clientX - drag.startX) / r.width * d;
   if (drag.type === "move") {
     const length = drag.end - drag.start;
-    b.start = Math.max(0, Math.min(duration() - length, drag.start + delta));
+    b.start = Math.max(0, Math.min(d - length, drag.start + delta));
     b.end = b.start + length;
   } else {
-    const t = Math.max(0, Math.min(duration(), (e.clientX - r.left) / r.width * duration()));
+    const t = Math.max(0, Math.min(d, (e.clientX - r.left) / r.width * d));
     if (drag.type === "left") b.start = Math.min(t, b.end - .05);
     else if (drag.type === "right") b.end = Math.max(t, b.start + .05);
   }
   renderInspector(); renderTimeline(); renderPreview();
 };
-tracks.onpointerup = () => drag = null;
-tracks.onpointerleave = () => drag = null;
+
+tracks.onpointerup = () => {
+  if (!drag || drag.type === "position") return;
+  const { index, moved } = drag;
+  drag = null;
+  suppressClickUntil = performance.now() + 400; // the click that follows belongs to this drag
+  if (moved) renderAll(); else selectBlock(index, true);
+};
+
+// The browser took over the gesture, for example to scroll the timeline.
+tracks.onpointercancel = () => {
+  if (!drag || drag.type === "position") return;
+  const moved = drag.moved;
+  drag = null;
+  if (moved) renderAll();
+};
 
 function seekTimeline(e, element) {
   if (!video.src) return;
@@ -700,37 +1056,51 @@ function seekTimeline(e, element) {
   video.currentTime = Math.max(0, Math.min(duration(), (e.clientX - r.left) / r.width * duration()));
   updatePlayhead();
 }
-tracks.onclick = e => { if (e.target === tracks) seekTimeline(e, tracks); };
+
+// Clicking an empty part of the timeline or the ruler moves the playhead there.
+tracks.onclick = e => {
+  if (performance.now() < suppressClickUntil) return;
+  if (e.target === tracks || e.target.classList.contains("track-row")) seekTimeline(e, tracks);
+};
 $("ruler").onclick = e => seekTimeline(e, $("ruler"));
-$("timelineStart").onclick = () => { video.currentTime = 0; updatePlayhead(); };
-$("timelinePlay").onclick = () => video.paused ? video.play() : video.pause();
-$("timelinePrev").onclick = () => {
-  const order = sortedBlockIndices(), position = order.indexOf(selected);
-  if (position > 0) selectBlock(order[position - 1], true);
-};
-$("timelineNext").onclick = () => {
-  const order = sortedBlockIndices(), position = order.indexOf(selected);
-  if (position >= 0 && position < order.length - 1) selectBlock(order[position + 1], true);
-};
+$("timelineStart").onclick = () => { if (!video.src) return; video.currentTime = 0; updatePlayhead(); };
+$("timelinePlay").onclick = togglePlay;
+$("timelinePrev").onclick = () => stepBlock(-1);
+$("timelineNext").onclick = () => stepBlock(1);
+$("prevBlock").onclick = () => stepBlock(-1);
+$("nextBlock").onclick = () => stepBlock(1);
 $("timelineZoom").oninput = e => { timelineScale = Number(e.target.value); $("zoomValue").textContent = `${timelineScale} px/s`; renderTimeline(); };
-$("addBlock").onclick = () => { const t = video.currentTime || 0; blocks.push({ text: "New lyric line", start: t, end: Math.min(duration(), t + 2), x: 50, y: 86 }); selected = blocks.length - 1; renderAll(); };
-$("prevBlock").onclick = () => {
-  const order = sortedBlockIndices(), position = order.indexOf(selected);
-  if (position > 0) selectBlock(order[position - 1], true);
+
+$("addBlock").onclick = () => {
+  pushUndo();
+  const t = video.currentTime || 0;
+  const block = { text: "New lyric line", start: t, end: Math.min(duration(), t + 2), x: 50, y: 86 };
+  clampBlock(block);
+  blocks.push(block);
+  selected = blocks.length - 1;
+  setActiveTab("selected");
+  renderAll();
+  // Select the placeholder text so typing replaces it.
+  const editor = $("editText");
+  if (editor) { editor.focus(); editor.select(); }
 };
-$("nextBlock").onclick = () => {
-  const order = sortedBlockIndices(), position = order.indexOf(selected);
-  if (position >= 0 && position < order.length - 1) selectBlock(order[position + 1], true);
-};
+
 $("loadText").onclick = () => $("textFile").click();
-$("textFile").onchange = async e => { const f = e.target.files?.[0]; if (f) lyrics.value = await f.text(); };
+$("textFile").onchange = async e => {
+  const f = e.target.files?.[0];
+  e.target.value = ""; // lets the same file be chosen again later
+  if (f) lyrics.value = await f.text();
+};
 
 function setActiveTab(tabName) {
   document.querySelectorAll(".tab-button").forEach(btn => btn.classList.toggle("active", btn.dataset.tab === tabName));
   document.querySelectorAll(".tab-content").forEach(panel => panel.classList.toggle("active", panel.dataset.panel === tabName));
 }
 document.querySelectorAll(".tab-button").forEach(btn => btn.onclick = () => setActiveTab(btn.dataset.tab));
-setActiveTab("selected");
+
+// ---------------------------------------------------------------------------
+// Global style
+// ---------------------------------------------------------------------------
 
 $("styleSize").oninput = e => { style.size = +e.target.value; renderPreview(); };
 $("styleColor").oninput = e => { style.color = e.target.value; renderPreview(); };
@@ -740,6 +1110,29 @@ $("styleBox").onchange = e => { style.box = e.target.checked; renderPreview(); }
 $("styleBoxColor").oninput = e => { style.boxColor = e.target.value; renderPreview(); };
 $("styleBoxOpacity").oninput = e => { style.boxOpacity = +e.target.value; renderPreview(); };
 
+function syncStyleInputs() {
+  $("styleSize").value = style.size;
+  $("styleColor").value = style.color;
+  $("styleOutline").value = style.outline;
+  $("styleOutlineWidth").value = style.outlineWidth;
+  $("styleBox").checked = style.box;
+  $("styleBoxColor").value = style.boxColor;
+  $("styleBoxOpacity").value = style.boxOpacity;
+}
+
+// Copies known style settings with the right type from a project file or the autosave.
+function applyStyle(source) {
+  if (!source || typeof source !== "object") return;
+  for (const key of Object.keys(style)) {
+    if (typeof source[key] === typeof style[key]) style[key] = source[key];
+  }
+  syncStyleInputs();
+}
+
+// ---------------------------------------------------------------------------
+// Video export
+// ---------------------------------------------------------------------------
+
 function downloadFile(content, filename, type) {
   const blob = content instanceof Blob ? content : new Blob([content], { type });
   const url = URL.createObjectURL(blob);
@@ -748,141 +1141,381 @@ function downloadFile(content, filename, type) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
-let ffmpeg=null,ffmpegLoaded=false;
-async function loadFFmpeg(){
-  if(ffmpegLoaded)return ffmpeg;
-  status("Loading FFmpeg encoder into the browser...",2);
-  const {FFmpeg}=await import("https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.15/dist/esm/index.js");
-  ffmpeg=new FFmpeg();
-  ffmpeg.on("progress",({progress})=>{if(Number.isFinite(progress))status(`Converting to MP4... ${Math.round(Math.max(0,Math.min(1,progress))*100)}%`,70+progress*30)});
-  const {toBlobURL}=await import("https://cdn.jsdelivr.net/npm/@ffmpeg/util@0.12.2/dist/esm/index.js");
-  const baseURL="https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/esm";
-  const workerBase="https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.15/dist/esm";
-  const workerSource=await (await fetch(`${workerBase}/worker.js`)).text();
-  const workerModule=workerSource
-    .replaceAll('"./const.js"',`"${workerBase}/const.js"`)
-    .replaceAll('"./errors.js"',`"${workerBase}/errors.js"`);
-  const classWorkerURL=URL.createObjectURL(new Blob([workerModule],{type:"text/javascript"}));
-  try{
-    await ffmpeg.load({coreURL:await toBlobURL(`${baseURL}/ffmpeg-core.js`,"text/javascript"),wasmURL:await toBlobURL(`${baseURL}/ffmpeg-core.wasm`,"application/wasm"),classWorkerURL});
-  }finally{URL.revokeObjectURL(classWorkerURL)}
-  ffmpegLoaded=true;
+let ffmpeg = null, ffmpegLoaded = false;
+// Receives FFmpeg's progress (0 to 1) during a conversion, or null when no message is wanted.
+let ffmpegJob = null;
+
+async function loadFFmpeg() {
+  if (ffmpegLoaded) return ffmpeg;
+  status("Loading the FFmpeg video converter into the browser...");
+  const { FFmpeg } = await import("https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.15/dist/esm/index.js");
+  ffmpeg = new FFmpeg();
+  ffmpeg.on("progress", ({ progress }) => {
+    if (ffmpegJob && Number.isFinite(progress)) ffmpegJob(Math.max(0, Math.min(1, progress)));
+  });
+  const { toBlobURL } = await import("https://cdn.jsdelivr.net/npm/@ffmpeg/util@0.12.2/dist/esm/index.js");
+  const baseURL = "https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/esm";
+  // The FFmpeg worker imports its helper files with relative paths, which do not work when the
+  // worker runs from a blob URL. Download the worker and point those imports at the CDN.
+  const workerBase = "https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.15/dist/esm";
+  const workerSource = await (await fetch(`${workerBase}/worker.js`)).text();
+  const workerModule = workerSource
+    .replaceAll('"./const.js"', `"${workerBase}/const.js"`)
+    .replaceAll('"./errors.js"', `"${workerBase}/errors.js"`);
+  const classWorkerURL = URL.createObjectURL(new Blob([workerModule], { type: "text/javascript" }));
+  try {
+    await ffmpeg.load({
+      coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, "text/javascript"),
+      wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, "application/wasm"),
+      classWorkerURL
+    });
+  } finally {
+    URL.revokeObjectURL(classWorkerURL);
+  }
+  ffmpegLoaded = true;
   return ffmpeg;
 }
 
-function drawSubtitleToCanvas(ctx,b,vw,vh,previewHeight){
-  if(!b)return;
-  const scale=Number.isFinite(previewHeight)&&previewHeight>0?vh/previewHeight:vh/1080;
-  const fontSize=Math.max(12,Math.round((b.size ?? style.size)*scale));
-  ctx.font=`800 ${fontSize}px Inter,system-ui,sans-serif`;ctx.textAlign="center";ctx.textBaseline="middle";
-  const posX=b.x/100*vw,posY=b.y/100*vh,maxWidth=vw*((b.width ?? 80)/100),rawLines=String(b.text).split("\n"),lines=[];
-  rawLines.forEach(text=>{
-    const words=text.split(/\s+/),parts=[];let line="";
-    words.forEach(word=>{const candidate=line?`${line} ${word}`:word;if(line&&ctx.measureText(candidate).width>maxWidth) { parts.push(line);line=word; } else line=candidate;});
+// Draws one subtitle line onto the export canvas. Sizes are scaled from the preview to the full
+// video resolution, so the export looks like the preview.
+function drawSubtitleToCanvas(ctx, b, vw, vh, previewHeight) {
+  if (!b) return;
+  const scale = Number.isFinite(previewHeight) && previewHeight > 0 ? vh / previewHeight : vh / 1080;
+  const fontSize = Math.max(12, Math.round((b.size ?? style.size) * scale));
+  ctx.font = `800 ${fontSize}px Inter,system-ui,sans-serif`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  const posX = b.x / 100 * vw, posY = b.y / 100 * vh, maxWidth = vw * ((b.width ?? 80) / 100);
+  // Wrap long lines by words, the same way the preview does.
+  const lines = [];
+  String(b.text).split("\n").forEach(text => {
+    const words = text.split(/\s+/), parts = [];
+    let line = "";
+    words.forEach(word => {
+      const candidate = line ? `${line} ${word}` : word;
+      if (line && ctx.measureText(candidate).width > maxWidth) {
+        parts.push(line);
+        line = word;
+      } else {
+        line = candidate;
+      }
+    });
     parts.push(line);
     lines.push(...parts);
   });
-  const lineHeight=fontSize*1.2,totalHeight=lines.length*lineHeight;
-  let maxW=0;for(const line of lines)maxW=Math.max(maxW,ctx.measureText(line).width);
-  if(style.box){const padX=12*scale,padY=6*scale;ctx.fillStyle=`rgba(${hexToRgb(style.boxColor)},${style.boxOpacity})`;ctx.fillRect(posX-maxW/2-padX,posY-totalHeight/2-padY,maxW+padX*2,totalHeight+padY*2)}
-  lines.forEach((line,i)=>{const lineY=posY-totalHeight/2+(i+.5)*lineHeight;if(style.outlineWidth>0){ctx.strokeStyle=style.outline;ctx.lineWidth=Math.max(1,style.outlineWidth*scale*2);ctx.lineJoin="round";ctx.strokeText(line,posX,lineY)}ctx.fillStyle=style.color;ctx.fillText(line,posX,lineY)});
-}
-
-async function recordCanvasVideo(canvas,ctx,vw,vh){
-  status("Preparing media capture...",5);
-  const canvasStream=canvas.captureStream(30);
-  const previewHeight=getMediaBounds().height;
-  status("Media capture ready...",10);
-  const combinedStream=new MediaStream(canvasStream.getVideoTracks());
-  const mimeType=["video/webm;codecs=vp9,opus","video/webm;codecs=vp8,opus","video/webm"].find(m=>MediaRecorder.isTypeSupported(m));
-  if(!mimeType)throw Error("This browser cannot record WebM video.");
-  const recorder=new MediaRecorder(combinedStream,{mimeType,videoBitsPerSecond:30000000,audioBitsPerSecond:256000}),chunks=[];
-  status("Recorder ready...",15);
-  recorder.ondataavailable=e=>{if(e.data?.size)chunks.push(e.data)};
-  const stopped=new Promise((resolve,reject)=>{recorder.onstop=()=>resolve(new Blob(chunks,{type:mimeType}));recorder.onerror=e=>reject(e.error||Error("MediaRecorder export failed."))});
-  const originalTime=video.currentTime;video.pause();
-  if(originalTime>0.01){
-    video.currentTime=0;
-    await new Promise((resolve,reject)=>{video.addEventListener("seeked",resolve,{once:true});video.addEventListener("error",()=>reject(Error("Video seek failed during export.")),{once:true})});
+  const lineHeight = fontSize * 1.2, totalHeight = lines.length * lineHeight;
+  let maxW = 0;
+  for (const line of lines) maxW = Math.max(maxW, ctx.measureText(line).width);
+  if (style.box) {
+    const padX = 12 * scale, padY = 6 * scale;
+    ctx.fillStyle = `rgba(${hexToRgb(style.boxColor)},${style.boxOpacity})`;
+    ctx.fillRect(posX - maxW / 2 - padX, posY - totalHeight / 2 - padY, maxW + padX * 2, totalHeight + padY * 2);
   }
-  if(video.readyState<2)await new Promise((resolve,reject)=>{video.addEventListener("loadeddata",resolve,{once:true});video.addEventListener("error",()=>reject(Error("Video could not be decoded.")),{once:true})});
-  let raf=0;
-  const draw=()=>{ctx.drawImage(video,0,0,vw,vh);drawSubtitleToCanvas(ctx,blocks.find(x=>video.currentTime>=x.start&&video.currentTime<x.end),vw,vh,previewHeight);if(video.duration)status(`Rendering video + subtitles... ${Math.round(video.currentTime/video.duration*100)}%`,video.currentTime/video.duration*70);if(!video.ended)raf=requestAnimationFrame(draw)};
-  const finished=new Promise((resolve,reject)=>{
-    const cleanup=()=>{video.removeEventListener("ended",onEnded);video.removeEventListener("error",onError)};
-    const onEnded=()=>{cleanup();resolve()};
-    const onError=()=>{cleanup();reject(Error("Video playback failed during export."))};
-    video.addEventListener("ended",onEnded,{once:true});video.addEventListener("error",onError,{once:true});
+  lines.forEach((line, i) => {
+    const lineY = posY - totalHeight / 2 + (i + .5) * lineHeight;
+    if (style.outlineWidth > 0) {
+      ctx.strokeStyle = style.outline;
+      ctx.lineWidth = Math.max(1, style.outlineWidth * scale * 2);
+      ctx.lineJoin = "round";
+      ctx.strokeText(line, posX, lineY);
+    }
+    ctx.fillStyle = style.color;
+    ctx.fillText(line, posX, lineY);
   });
-  status("Starting video playback...",20);
-  const playPromise=video.play();
-  if(playPromise?.catch)playPromise.catch(err=>console.warn("Video playback promise rejected:",err));
-  await new Promise(resolve=>setTimeout(resolve,250));
-  if(video.paused)throw Error("Video playback could not start. Click the video once, then try export again.");
-  recorder.start();draw();await finished;
-  cancelAnimationFrame(raf);ctx.drawImage(video,0,0,vw,vh);drawSubtitleToCanvas(ctx,blocks.find(x=>video.currentTime>=x.start&&video.currentTime<x.end),vw,vh,previewHeight);recorder.stop();
-  const recordedBlob=await stopped;canvasStream.getTracks().forEach(t=>t.stop());combinedStream.getTracks().forEach(t=>t.stop());video.pause();video.currentTime=originalTime;return recordedBlob;
 }
 
-$("exportVideo").onclick=async(event)=>{
+// Plays the media from the start and records every frame (video picture or black, plus the
+// subtitle) from a canvas. This takes as long as the song. Returns the recording and its type.
+async function recordCanvasVideo(canvas, ctx, vw, vh) {
+  status("Preparing the recording...", 5);
+  const canvasStream = canvas.captureStream(30);
+  const previewHeight = getMediaBounds().height;
+  // H.264 in MP4 (Chrome, Edge, Safari) can go into the final file as it is, which makes the
+  // conversion afterwards take seconds. Firefox records only WebM, which has to be converted.
+  const mimeType = ["video/mp4;codecs=avc1", "video/mp4", "video/webm;codecs=vp9", "video/webm;codecs=vp8", "video/webm"]
+    .find(m => MediaRecorder.isTypeSupported(m));
+  if (!mimeType) throw Error("This browser cannot record video. Try Chrome or Edge on a computer.");
+  // About 0.2 bits per pixel at 30 frames per second: sharp, but small enough to send in a chat app.
+  const videoBitsPerSecond = Math.round(Math.min(16e6, Math.max(4e6, vw * vh * 30 * 0.2)));
+  const recorder = new MediaRecorder(canvasStream, { mimeType, videoBitsPerSecond }), chunks = [];
+  recorder.ondataavailable = e => { if (e.data?.size) chunks.push(e.data); };
+  const stopped = new Promise((resolve, reject) => {
+    recorder.onstop = () => resolve(new Blob(chunks, { type: mimeType }));
+    recorder.onerror = e => reject(e.error || Error("Recording the video failed."));
+  });
+
+  const originalTime = video.currentTime;
+  video.pause();
+  if (originalTime > 0.01) {
+    video.currentTime = 0;
+    await new Promise((resolve, reject) => {
+      video.addEventListener("seeked", resolve, { once: true });
+      video.addEventListener("error", () => reject(Error("Video seek failed during export.")), { once: true });
+    });
+  }
+  if (video.readyState < 2) {
+    await new Promise((resolve, reject) => {
+      video.addEventListener("loadeddata", resolve, { once: true });
+      video.addEventListener("error", () => reject(Error("Video could not be decoded.")), { once: true });
+    });
+  }
+
+  const drawFrame = () => {
+    if (video.videoWidth) {
+      ctx.drawImage(video, 0, 0, vw, vh);
+    } else {
+      ctx.fillStyle = "#000";
+      ctx.fillRect(0, 0, vw, vh);
+    }
+    drawSubtitleToCanvas(ctx, blocks.find(x => video.currentTime >= x.start && video.currentTime < x.end), vw, vh, previewHeight);
+  };
+  let raf = 0;
+  const draw = () => {
+    drawFrame();
+    if (video.duration) status(`Recording the video... ${Math.round(video.currentTime / video.duration * 100)}%. Keep this tab open and visible.`, video.currentTime / video.duration * 70);
+    if (!video.ended) raf = requestAnimationFrame(draw);
+  };
+  // Browsers pause drawing in hidden tabs, which would freeze the recording.
+  const onVisibility = () => {
+    if (document.hidden) status("This tab is hidden, so the recording is paused or frozen. Come back to this tab and keep it open.");
+  };
+  document.addEventListener("visibilitychange", onVisibility);
+  const finished = new Promise((resolve, reject) => {
+    const cleanup = () => { video.removeEventListener("ended", onEnded); video.removeEventListener("error", onError); };
+    const onEnded = () => { cleanup(); resolve(); };
+    const onError = () => { cleanup(); reject(Error("Video playback failed during export.")); };
+    video.addEventListener("ended", onEnded, { once: true });
+    video.addEventListener("error", onError, { once: true });
+  });
+
+  try {
+    status("Starting playback...", 8);
+    const playPromise = video.play();
+    if (playPromise?.catch) playPromise.catch(err => console.warn("Video playback promise rejected:", err));
+    await new Promise(resolve => setTimeout(resolve, 250));
+    if (video.paused) throw Error("Video playback could not start. Tap the video once, then try export again.");
+    recorder.start();
+    draw();
+    await finished;
+    cancelAnimationFrame(raf);
+    drawFrame();
+    recorder.stop();
+    const recordedBlob = await stopped;
+    return { blob: recordedBlob, mimeType };
+  } finally {
+    document.removeEventListener("visibilitychange", onVisibility);
+    canvasStream.getTracks().forEach(t => t.stop());
+    video.pause();
+    video.currentTime = originalTime;
+  }
+}
+
+$("exportVideo").onclick = async event => {
   event.preventDefault();
   event.stopPropagation();
-  if(!video.src||video.classList.contains("hidden"))return status("Please load a video file first.",0);
-  if(!blocks.length)return status("No timing blocks to render onto the video.",0);
-  if(!window.MediaRecorder||!HTMLCanvasElement.prototype.captureStream)return status("This browser does not support video export.",0);
-  const exportBtn=$("exportVideo");exportBtn.disabled=true;
-  try{
-    const vw=video.videoWidth,vh=video.videoHeight;if(!vw||!vh)throw Error("Could not read the original video dimensions.");
-    status(`Preparing ${vw}×${vh} video export...`,0);
-    const canvas=document.createElement("canvas");canvas.width=vw;canvas.height=vh;const ctx=canvas.getContext("2d",{alpha:false});if(!ctx)throw Error("Could not create export canvas.");
-    const recordedBlob=await recordCanvasVideo(canvas,ctx,vw,vh);status("Loading MP4 encoder...",72);
-    const enc=await loadFFmpeg(),inputName="lyrics-render.webm",sourceName="original-video",outputName="subtitled-video.mp4";
-    await enc.writeFile(inputName,new Uint8Array(await recordedBlob.arrayBuffer()));
-    await enc.writeFile(sourceName,new Uint8Array(await mediaFile.arrayBuffer()));
-    await enc.exec(["-i",inputName,"-i",sourceName,"-map","0:v:0","-map","1:a:0?","-c:v","libx264","-preset","ultrafast","-crf","20","-pix_fmt","yuv420p","-c:a","aac","-b:a","256k","-shortest","-movflags","+faststart",outputName]);
-    const data=await enc.readFile(outputName);downloadFile(new Blob([data],{type:"video/mp4"}),`subtitled-video-${vw}x${vh}.mp4`,"video/mp4");
-    await enc.deleteFile(inputName);await enc.deleteFile(sourceName);await enc.deleteFile(outputName);status(`MP4 export completed: ${vw}×${vh} H.264/AAC`,100);video.currentTime=0;
-  }catch(err){console.error(err);status(`Export error: ${err?.message||err}`,0);alert(`Export failed: ${err?.message||err}`)}
-  finally{exportBtn.disabled=false}
+  if (!mediaFile || !video.src) return status("Choose a video or song first.", 0);
+  if (!blocks.length) return status("There are no timed lines to put on the video yet.", 0);
+  if (!window.MediaRecorder || !HTMLCanvasElement.prototype.captureStream) return status("This browser cannot export video. Try Chrome or Edge on a computer.", 0);
+  const exportBtn = $("exportVideo");
+  exportBtn.disabled = true;
+  const wasMuted = video.muted;
+  try {
+    if (video.readyState < 1) await new Promise(resolve => video.addEventListener("loadedmetadata", resolve, { once: true }));
+    // A song without video becomes a 1920×1080 video with the lyrics on black.
+    const vw = video.videoWidth || AUDIO_EXPORT_WIDTH, vh = video.videoHeight || AUDIO_EXPORT_HEIGHT;
+    status(`Preparing a ${vw}×${vh} video. This takes as long as the song, plus a few minutes. Keep this tab open.`, 0);
+    const canvas = document.createElement("canvas");
+    canvas.width = vw;
+    canvas.height = vh;
+    const ctx = canvas.getContext("2d", { alpha: false });
+    if (!ctx) throw Error("Could not create the export canvas.");
+
+    // The sound is copied from the original file afterwards, so the recording can play silently.
+    video.muted = true;
+    const { blob, mimeType } = await recordCanvasVideo(canvas, ctx, vw, vh);
+    video.muted = wasMuted;
+
+    status("Loading the MP4 converter...", 72);
+    const enc = await loadFFmpeg();
+    const recordedMp4 = mimeType.startsWith("video/mp4");
+    const inputName = recordedMp4 ? "lyrics-render.mp4" : "lyrics-render.webm";
+    const sourceName = "original-media", outputName = "subtitled-video.mp4";
+    await enc.writeFile(inputName, new Uint8Array(await blob.arrayBuffer()));
+    await enc.writeFile(sourceName, new Uint8Array(await mediaFile.arrayBuffer()));
+    // Picture from the recording, sound from the original file.
+    const inputs = ["-y", "-i", inputName, "-i", sourceName, "-map", "0:v:0", "-map", "1:a:0?"]; // -y: overwrite leftovers
+    const output = ["-c:a", "aac", "-b:a", "256k", "-shortest", "-movflags", "+faststart", outputName];
+    ffmpegJob = progress => status(`Converting to MP4... ${Math.round(progress * 100)}%`, 70 + progress * 30);
+    try {
+      // An H.264 recording is copied as it is; only the sound is encoded, which is fast.
+      let exitCode = recordedMp4 ? await enc.exec([...inputs, "-c:v", "copy", ...output]) : 1;
+      if (exitCode !== 0) {
+        // WebM, or an MP4 that could not be copied: encode the picture again (slow).
+        status("Converting the video to MP4. For long or large videos this can take a while...", 72);
+        exitCode = await enc.exec([...inputs, "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20", "-pix_fmt", "yuv420p", ...output]);
+      }
+      if (exitCode !== 0) throw Error("FFmpeg could not create the MP4 file.");
+    } finally {
+      ffmpegJob = null;
+    }
+    const data = await enc.readFile(outputName);
+    const fileName = `${baseName(mediaFile.name)} - lyrics.mp4`;
+    downloadFile(new Blob([data], { type: "video/mp4" }), fileName, "video/mp4");
+    await enc.deleteFile(inputName);
+    await enc.deleteFile(sourceName);
+    await enc.deleteFile(outputName);
+    status(`Done! "${fileName}" (${vw}×${vh}) was saved to your downloads.`, 100);
+    video.currentTime = 0;
+  } catch (err) {
+    console.error(err);
+    status(`Export error: ${err?.message || err}`, 0);
+    alert(`Export failed: ${err?.message || err}`);
+  } finally {
+    video.muted = wasMuted;
+    exportBtn.disabled = false;
+  }
 };
 
+// ---------------------------------------------------------------------------
+// Saving: project files and the automatic save in this browser
+// ---------------------------------------------------------------------------
+
+function sessionData() {
+  return { lyrics: lyrics.value, blocks, style, mediaName: mediaFile?.name || savedMediaName };
+}
+
 $("saveProject").onclick = () => {
-  const projectData = JSON.stringify({ blocks, style }, null, 2);
-  downloadFile(projectData, "lyrics-project.json", "application/json");
+  if (!blocks.length && !lyrics.value.trim()) return status("There is nothing to save yet.");
+  const projectData = JSON.stringify({ app: "Lyrics Studio", version: 1, ...sessionData() }, null, 2);
+  downloadFile(projectData, `${baseName(mediaFile?.name || savedMediaName)} - lyrics project.json`, "application/json");
+  status("Project saved to your downloads. Open it later with Open project.", 100);
 };
 
 $("loadProject").onclick = () => $("projectFile").click();
 $("projectFile").onchange = async e => {
   const f = e.target.files?.[0];
+  e.target.value = ""; // lets the same file be chosen again later
   if (!f) return;
   try {
     const json = JSON.parse(await f.text());
-    if (json.blocks) blocks = json.blocks;
-    if (json.style) Object.assign(style, json.style);
+    if (!json || !Array.isArray(json.blocks)) throw Error("it is not a Lyrics Studio project");
+    pushUndo();
+    blocks = sanitizeBlocks(json.blocks);
+    applyStyle(json.style);
+    if (typeof json.lyrics === "string" && json.lyrics.trim()) lyrics.value = json.lyrics;
+    if (!mediaFile && typeof json.mediaName === "string") savedMediaName = json.mediaName;
+    if (Number.isFinite(video.duration) && video.duration > 0) blocks.forEach(clampBlock);
     selected = blocks.length ? 0 : -1;
     renderAll();
-    status("Project loaded successfully.", 100);
+    status(`Opened a project with ${blocks.length} lines.${mediaFile ? "" : " Choose its video or song to preview it."}`, 100);
   } catch (err) {
-    status("Failed to parse project file.", 0);
+    status(`This file could not be opened as a project: ${err.message}.`, 0);
   }
 };
 
+// Everything except the media file is saved in this browser every few seconds and when the page
+// is hidden or closed, so a reload or a closed tab does not lose work. The media file itself is
+// too large to store, so the user chooses it again.
+let lastAutosave = "";
+function autosave() {
+  const json = JSON.stringify(sessionData());
+  if (json !== lastAutosave && storageSet(STORAGE_KEY, json)) lastAutosave = json;
+}
+
+function restoreSession() {
+  let saved = null;
+  try { saved = JSON.parse(storageGet(STORAGE_KEY) || "null"); } catch { saved = null; }
+  if (!saved || typeof saved !== "object") return;
+  if (typeof saved.lyrics === "string") lyrics.value = saved.lyrics;
+  applyStyle(saved.style);
+  blocks = sanitizeBlocks(saved.blocks);
+  savedMediaName = typeof saved.mediaName === "string" ? saved.mediaName : "";
+  selected = blocks.length ? 0 : -1;
+  lastAutosave = JSON.stringify(sessionData());
+  if (blocks.length) {
+    status(`Welcome back! Your ${blocks.length} timed lines were restored. Choose ${savedMediaName ? `"${savedMediaName}"` : "your video"} again to keep working.`);
+  } else if (lyrics.value.trim()) {
+    status("Welcome back! Your lyrics were restored.");
+  }
+}
+
+setInterval(autosave, 2000);
+document.addEventListener("visibilitychange", () => { if (document.hidden) autosave(); });
+window.addEventListener("pagehide", autosave);
+
+// ---------------------------------------------------------------------------
+// Keyboard shortcuts
+// ---------------------------------------------------------------------------
+
+// Space: play or pause. Delete or Backspace: delete the selected line.
+// Left and Right: previous and next line (with Shift: move 1 second). Ctrl+Z / Ctrl+Y: undo and redo.
 window.addEventListener("keydown", e => {
-  if (["INPUT", "TEXTAREA", "SELECT"].includes(document.activeElement.tagName)) return;
+  // During Tap along, Space or Enter is the tap button and Esc stops.
+  if (tap) {
+    if (e.code === "Space" || e.code === "Enter" || e.code === "NumpadEnter") {
+      e.preventDefault();
+      if (!e.repeat) tapDown();
+    } else if (e.code === "Escape") {
+      e.preventDefault();
+      finishTapAlong(false);
+    }
+    return;
+  }
+  const el = document.activeElement;
+  const typing = el && (["INPUT", "TEXTAREA", "SELECT"].includes(el.tagName) || el.isContentEditable);
+  const key = (e.key || "").toLowerCase();
+  if ((e.ctrlKey || e.metaKey) && !e.altKey && (key === "z" || key === "y")) {
+    if (typing) return; // text fields keep their own undo
+    e.preventDefault();
+    if (key === "y" || e.shiftKey) redo(); else undo();
+    return;
+  }
+  if (typing || e.ctrlKey || e.metaKey || e.altKey) return;
+  if (el?.tagName === "VIDEO") return; // the video's own controls handle keys while it has focus
   if (e.code === "Space") {
     e.preventDefault();
-    video.paused ? video.play() : video.pause();
+    // Without this, Space would also press the button that has focus.
+    if (el?.tagName === "BUTTON") el.blur();
+    togglePlay();
   } else if (e.code === "Delete" || e.code === "Backspace") {
     if (selected >= 0) {
-      blocks.splice(selected, 1);
-      selected = -1;
-      renderAll();
+      e.preventDefault();
+      deleteBlock(selected);
     }
   } else if (e.code === "ArrowLeft") {
-    if (e.shiftKey) video.currentTime = Math.max(0, video.currentTime - 1);
-    else selectBlock(Math.max(0, selected - 1), true);
+    e.preventDefault();
+    if (e.shiftKey) seekBy(-1); else stepBlock(-1);
   } else if (e.code === "ArrowRight") {
-    if (e.shiftKey) video.currentTime = Math.min(duration(), video.currentTime + 1);
-    else selectBlock(Math.min(blocks.length - 1, selected + 1), true);
+    e.preventDefault();
+    if (e.shiftKey) seekBy(1); else stepBlock(1);
   }
 });
+
+window.addEventListener("keyup", e => {
+  if (tap && (e.code === "Space" || e.code === "Enter" || e.code === "NumpadEnter")) {
+    e.preventDefault();
+    tapUp();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Start
+// ---------------------------------------------------------------------------
+
+if (storageGet(STEPS_HIDDEN_KEY) === "1") $("steps").classList.add("hidden");
+$("closeSteps").onclick = () => {
+  $("steps").classList.add("hidden");
+  storageSet(STEPS_HIDDEN_KEY, "1");
+};
+
+// Phones start zoomed out, so a whole line, including both edges, fits on the screen.
+if (matchMedia("(max-width: 680px)").matches) {
+  timelineScale = 30;
+  $("timelineZoom").value = timelineScale;
+  $("zoomValue").textContent = `${timelineScale} px/s`;
+}
+
+setActiveTab("selected");
+restoreSession();
+renderAll();
+updateUndoButtons();

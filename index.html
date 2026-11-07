@@ -4,6 +4,14 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Lyrics Studio</title>
+  <meta name="description" content="Free lyric video maker that runs in your browser. Time your lyrics with AI, fix them on a timeline and export an MP4. Nothing is uploaded.">
+  <meta name="theme-color" content="#111318">
+  <!-- Shown as the link preview in Telegram, WhatsApp and other apps -->
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="Lyrics Studio: make a lyric video in your browser">
+  <meta property="og:description" content="Paste the lyrics, let AI time them, fix them on a timeline and export an MP4. Free, no sign-up, your files stay on your device.">
+  <meta property="og:url" content="https://emmakarapetyan.github.io/Lyrics_Studio/">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%237c9cff'/%3E%3Ccircle cx='22' cy='45' r='7' fill='%23081024'/%3E%3Ccircle cx='44' cy='41' r='7' fill='%23081024'/%3E%3Cpath d='M26 45V17l25-5v29h-4V18l-17 3.4V45z' fill='%23081024'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -11,40 +19,46 @@
   <header class="topbar">
     <div><div class="brand">Lyrics <span>Studio</span></div><div class="subtitle">A simple browser editor for timed lyrics and subtitles</div></div>
     <div class="actions">
-      <button class="ghost" id="saveProject">Save project</button>
-      <button class="ghost" id="loadProject">Load project</button>
+      <button type="button" class="ghost" id="undo" title="Undo (Ctrl+Z)" disabled>↶ Undo</button>
+      <button type="button" class="ghost" id="redo" title="Redo (Ctrl+Y)" disabled>↷ Redo</button>
+      <button type="button" class="ghost" id="saveProject" title="Download your lines and style as a file">Save project</button>
+      <button type="button" class="ghost" id="loadProject" title="Open a project file you saved before">Open project</button>
       <button type="button" class="primary" id="exportVideo">Export High Quality Video</button>
-      <input id="projectFile" class="hidden" type="file" accept=".json">
+      <input id="projectFile" class="hidden" type="file" accept=".json,application/json">
     </div>
   </header>
+  <section class="steps" id="steps">
+    <ol>
+      <li>Choose a video or song</li>
+      <li>Paste the lyrics, one line per subtitle</li>
+      <li>Time them with AI, or split evenly</li>
+      <li>Fix lines on the timeline</li>
+      <li>Export the video</li>
+    </ol>
+    <button type="button" class="close" id="closeSteps" title="Hide these steps" aria-label="Hide these steps">×</button>
+  </section>
   <section class="workspace">
     <aside class="panel">
       <div class="panel-head">Source</div>
       <div class="panel-body">
-        <div class="field"><label>Video or audio</label><input id="media" class="file" type="file" accept="video/*,audio/*,.mp3,.wav,.m4a,.mp4,.webm"><div class="hint">Your file stays on this device.</div></div>
-        <div class="field"><label>Language</label>
-          <select id="language" class="small-input">
-            <option value="hy" selected>Armenian</option>
-            <option value="en">English</option>
-            <option value="es">Spanish</option>
-            <option value="fr">French</option>
-            <option value="de">German</option>
-            <option value="it">Italian</option>
-            <option value="ru">Russian</option>
-            <option value="auto">Auto-Detect</option>
-          </select>
+        <div class="field"><label for="media">Video or audio</label><input id="media" class="file" type="file" accept="video/*,audio/*,.mp3,.wav,.m4a,.mp4,.webm"><div class="hint">Your file stays on this device. Nothing is uploaded.</div>
+          <details class="more" id="vocalsOption">
+            <summary>Have the vocals as a separate file?</summary>
+            <input id="vocals" class="file" type="file" accept="audio/*,video/*,.mp3,.wav,.m4a" aria-label="Vocals-only file">
+            <div class="hint">Some song tools, for example Suno, can give you the vocals without the music. AI timing then listens to that file instead of the full song, which is much more accurate. The video still uses the full song.</div>
+          </details>
         </div>
-        <div class="field"><label>Lyrics</label><textarea id="lyrics" class="lyrics" placeholder="Paste lyrics here. One subtitle line per line."></textarea><div class="row" style="margin-top:7px"><button type="button" class="ghost" id="loadText">Load .txt</button><input id="textFile" class="hidden" type="file" accept=".txt"></div></div>
-        <div class="field"><label>Timing method</label><div class="row"><button type="button" class="ghost grow" id="manualTiming">Manual evenly divided</button><button type="button" class="primary grow" id="generate">Generate with AI</button></div><div class="hint" style="margin-top:7px">Manual first prepares editable text and timings. Click Next to create the timeline blocks.</div><div id="manualEditor"></div></div>
-        <div id="status" class="status" style="margin-top:10px">Ready. The first generation downloads the speech model into your browser.</div><div class="progress"><i id="progress"></i></div>
+        <div class="field"><label for="lyrics">Lyrics</label><textarea id="lyrics" class="lyrics" placeholder="Paste lyrics here. One subtitle line per line."></textarea><div class="row" style="margin-top:7px"><button type="button" class="ghost" id="loadText">Load .txt</button><input id="textFile" class="hidden" type="file" accept=".txt,text/plain"></div></div>
+        <div class="field"><label>Timing</label><div class="row"><button type="button" class="primary grow" id="generate">Time with AI</button></div><div class="row" style="margin-top:7px"><button type="button" class="ghost grow" id="tapAlong">Tap along</button><button type="button" class="ghost grow" id="manualTiming">Split evenly</button></div><div class="hint" style="margin-top:7px"><b>Time with AI</b> listens to the song and finds when each line of your lyrics is sung. It works with any language. The first time, it downloads a 300 MB model, which can take a few minutes; after that the browser keeps it.<br><b>Tap along</b> plays the song while you hold a button during each line. It takes one listen and is the most exact way when the AI gets lines wrong.<br><b>Split evenly</b> gives every line the same length, so you can set the times yourself.</div><div id="manualEditor"></div></div>
+        <div id="status" class="status" style="margin-top:10px" role="status" aria-live="polite">Ready. Your work is saved in this browser automatically.</div><div class="progress"><i id="progress"></i></div>
       </div>
     </aside>
     <div class="main-editor">
       <div class="left-stack">
         <section class="panel">
           <div class="panel-head"><span>Preview</span><span class="timecode" id="clock">00:00.00</span></div>
-          <div class="stage"><div class="video-wrap" id="videoWrap"><div class="empty-stage" id="emptyStage">Choose a video to start previewing</div><video id="video" controls playsinline class="hidden"></video><div class="preview-layer"><div id="overlay" class="subtitle-overlay hidden"></div></div></div>
-            <div class="stage-tools"><div class="row"><button class="ghost" id="prevBlock">◀ Previous</button><button class="ghost" id="nextBlock">Next ▶</button></div><div class="hint">Drag the subtitle in the video to reposition it</div></div>
+          <div class="stage"><div class="video-wrap" id="videoWrap"><div class="empty-stage" id="emptyStage">Choose a video or song to start previewing</div><video id="video" controls playsinline class="hidden"></video><div class="preview-layer"><div id="overlay" class="subtitle-overlay hidden"></div></div></div>
+            <div class="stage-tools"><div class="row"><button type="button" class="ghost" id="prevBlock">◀ Previous</button><button type="button" class="ghost" id="nextBlock">Next ▶</button></div><div class="hint">Drag the subtitle in the video to move it</div></div>
           </div>
         </section>
       </div>
@@ -52,15 +66,15 @@
         <aside class="panel right-panel">
           <div class="panel-head tab-head">
             <div class="tab-strip">
-              <button class="tab-button active" data-tab="selected">Selected block</button>
-              <button class="tab-button" data-tab="style">Global style</button>
-              <button class="tab-button" data-tab="edit">Edit blocks</button>
-              <button class="tab-button" data-tab="list">All blocks</button>
+              <button type="button" class="tab-button active" data-tab="selected">Selected line</button>
+              <button type="button" class="tab-button" data-tab="style">Global style</button>
+              <button type="button" class="tab-button" data-tab="edit">Edit lines</button>
+              <button type="button" class="tab-button" data-tab="list">All lines</button>
             </div>
-            <button class="ghost" id="addBlock">+ Add</button>
+            <button type="button" class="ghost" id="addBlock">+ Add line</button>
           </div>
           <div class="panel-body tab-panel-body">
-            <div class="tab-content active" data-panel="selected" id="inspector"><div class="hint">Generate timing or select a block to edit it.</div></div>
+            <div class="tab-content active" data-panel="selected" id="inspector"><div class="hint">Time your lyrics or select a line to edit it.</div></div>
             <div class="tab-content" data-panel="style" id="stylePanel">
               <div class="editor-row"><label>Font size<input id="styleSize" type="number" min="12" max="120" value="36"></label><label>Text color<input id="styleColor" type="color" value="#ffffff"></label></div>
               <div class="editor-row" style="margin-top:8px"><label>Outline color<input id="styleOutline" type="color" value="#000000"></label><label>Outline width<input id="styleOutlineWidth" type="number" min="0" max="12" value="0"></label></div>
@@ -76,16 +90,25 @@
     </div>
   </section>
   <section class="panel timeline-panel">
-    <div class="panel-head"><span>Timeline</span><span class="hint">Edit timing like a video track</span></div>
-    <div class="timeline-tools"><div class="transport"><button class="ghost" id="timelineStart" title="Go to start">|&lt;</button><button class="ghost" id="timelinePrev" title="Previous block">&lt;</button><button class="primary" id="timelinePlay" title="Play / pause">Play</button><button class="ghost" id="timelineNext" title="Next block">&gt;</button></div><span class="timeline-readout" id="timelineReadout">00:00.00 / 00:00.00</span><div class="zoom-control"><span>Zoom</span><input id="timelineZoom" type="range" min="30" max="180" value="60" step="5"><span id="zoomValue">60 px/s</span></div></div>
+    <div class="panel-head"><span>Timeline</span><span class="hint">Select a line, then drag it or its edges</span></div>
+    <div class="timeline-tools"><div class="transport"><button type="button" class="ghost" id="timelineStart" title="Go to start">|&lt;</button><button type="button" class="ghost" id="timelinePrev" title="Previous line">&lt;</button><button type="button" class="primary" id="timelinePlay" title="Play / pause (Space)">Play</button><button type="button" class="ghost" id="timelineNext" title="Next line">&gt;</button></div><span class="timeline-readout" id="timelineReadout">00:00.00 / 00:00.00</span><div class="zoom-control"><span>Zoom</span><input id="timelineZoom" type="range" min="10" max="180" value="60" step="5" aria-label="Timeline zoom"><span id="zoomValue">60 px/s</span></div></div>
     <div class="timeline"><div class="timeline-inner" id="timelineInner"><div id="ruler" class="ruler"></div><div class="track-label">Lyrics</div><div id="tracks" class="tracks"><div id="playhead" class="playhead"></div></div></div></div>
+  </section>
+  <section class="tap-bar hidden" id="tapBar" aria-label="Tap along">
+    <div class="tap-info"><div class="hint" id="tapProgress">Line 1</div><div class="tap-next" id="tapNext"></div></div>
+    <div class="tap-controls">
+      <button type="button" class="primary tap-button" id="tapButton">Hold while the line is sung</button>
+      <label class="hint tap-speed">Speed <select id="tapSpeed" class="small-input"><option value="1">1×</option><option value="0.75">0.75×</option><option value="0.5">0.5×</option></select></label>
+      <button type="button" class="ghost" id="tapStop">Stop</button>
+    </div>
   </section>
 </main>
 <script>
+  // Browsers block the app's modules when the page is opened as a file, so explain what to do instead.
   if (location.protocol === "file:") {
     const warning = document.createElement("div");
     warning.style.cssText = "position:fixed;inset:0;z-index:9999;background:#111318;color:#f4f5f7;padding:24px;font:16px/1.5 system-ui,sans-serif";
-    warning.innerHTML = "<h2>Open Lyrics Studio through a web address</h2><p>This HTML viewer opened the file directly. The editor cannot load its AI and video modules from <code>file://</code>, so the buttons cannot work in this mode.</p><p>Use a normal web address from a hosted copy, or run the included local server and open its network address on the phone.</p>";
+    warning.innerHTML = "<h2>Open Lyrics Studio through a web address</h2><p>This page was opened directly as a file. Browsers do not let it load its AI and video modules this way, so the buttons cannot work.</p><p>Use the online version at <a style=\"color:#7c9cff\" href=\"https://emmakarapetyan.github.io/Lyrics_Studio/\">emmakarapetyan.github.io/Lyrics_Studio</a>, or run <code>python -m http.server 8765</code> in this folder and open <code>http://localhost:8765</code>.</p>";
     document.body.appendChild(warning);
   }
 </script>
