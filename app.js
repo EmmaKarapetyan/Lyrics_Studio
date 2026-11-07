@@ -424,8 +424,12 @@ function startTapAlong() {
   manualDraft = [];
   renderManualDraft();
   const order = sortedBlockIndices();
-  // With existing lines, start at the selected line, so one part of the song can be redone.
-  const position = sameLines ? Math.max(0, order.indexOf(selected)) : 0;
+  // With existing lines, tapping can start at the selected line, so one part of the song can be
+  // redone. The selected line also changes by itself while the video plays, so ask first.
+  let position = sameLines ? Math.max(0, order.indexOf(selected)) : 0;
+  if (position > 0 && !confirm(`Start tapping from line ${position + 1}, "${shorten(blocks[order[position]].text)}"?\n\nOK: start from this line. The lines before it keep their times.\nCancel: start from the first line.`)) {
+    position = 0;
+  }
   tap = { order, position, holding: false, pending: new Set(order.slice(position)) };
   video.playbackRate = Number($("tapSpeed").value) || 1;
   video.currentTime = position === 0 ? 0 : Math.max(0, blocks[order[position]].start - 3);
@@ -434,8 +438,10 @@ function startTapAlong() {
   $("tapBar").classList.remove("hidden");
   renderAll();
   updateTapBar();
+  // On a phone the preview is below the buttons; show it, so the subtitles can be seen while tapping.
+  $("videoWrap").scrollIntoView({ behavior: "smooth", block: "start" });
   playVideo();
-  status("Hold the button (or Space) while each line is sung, and let go when it ends. Stop or Esc ends tapping.");
+  status(`Tapping from line ${position + 1}. Hold the button (or Space) while each line is sung, and let go when it ends. Stop or Esc ends tapping.`);
 }
 
 function updateTapBar() {
