@@ -128,7 +128,7 @@ Then open `http://localhost:8765`.
 
 To try it on a phone on the same Wi-Fi network, start the server with `--bind 0.0.0.0` and open `http://<your computer's IP address>:8765` on the phone. If the phone cannot connect, allow Python through the Windows Firewall.
 
-Every push to `main` publishes the site with GitHub Pages (see `.github/workflows/pages.yml`).
+Every push to `main` publishes the site with GitHub Pages (see `.github/workflows/pages.yml`). The workflow adds the commit to the address of each file (`app.js?v=…`), so a normal refresh loads a new release straight away.
 
 ## License
 

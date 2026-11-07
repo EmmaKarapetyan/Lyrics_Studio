@@ -30,6 +30,18 @@ jobs:
         with:
           enablement: true
 
+      # GitHub Pages lets browsers keep a file for 10 minutes, and a normal refresh only checks
+      # index.html again. Adding the commit to the address of every other file makes a refresh
+      # load the new release at once, instead of a mix of old and new files.
+      - name: Add the version to file addresses
+        run: |
+          v="${GITHUB_SHA::7}"
+          sed -i "s|href=\"styles.css\"|href=\"styles.css?v=$v\"|; s|src=\"app.js\"|src=\"app.js?v=$v\"|" index.html
+          sed -i "s|from \"./align.js\"|from \"./align.js?v=$v\"|; s|new URL(\"./aligner-worker.js\"|new URL(\"./aligner-worker.js?v=$v\"|" app.js
+          sed -i "s|from \"./align.js\"|from \"./align.js?v=$v\"|" aligner-worker.js
+          grep -q "styles.css?v=$v" index.html && grep -q "app.js?v=$v" index.html
+          grep -q "align.js?v=$v" app.js && grep -q "aligner-worker.js?v=$v" app.js && grep -q "align.js?v=$v" aligner-worker.js
+
       - name: Upload site
         uses: actions/upload-pages-artifact@v3
         with:
