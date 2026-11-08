@@ -76,14 +76,18 @@ To fix a line:
 - **Exact times:** in **Selected line**, type the start and end, or click **Start here** / **End here** at the current video position.
 - **Many lines at once:** **Edit lines** shows every line with its text, start and end, so you can type them in one list.
 - **Change the order:** in **Edit lines**, drag a line by its number, or click ▲ / ▼ next to it. The times stay in their places and the lines move: the moved line takes the times of its new place, and the lines it passes shift by one place. If the **Lyrics** box has the same lines, it gets the new order too, so Tap along still works.
-- **Position on the screen:** drag the subtitle in the preview.
+- **Position on the screen:** drag the subtitle in the preview. A subtitle always stays inside the picture: lines break at the line width measured on the video itself, a subtitle that would stick out is moved in, and text taller than the picture is made smaller until it fits. The exported video looks the same as the preview.
 - **One line's text, size and width:** in **Selected line**.
 - **All lines at once:** in **Global style**, set the text size, text color, an outline and a background box. Each change shows at once in the preview. The text size is for every line: it also replaces a size you gave to a single line, so give a line its own size in **Selected line** after that. Settings that do nothing yet are greyed out (the outline color until the outline has a width, the box color and opacity until the box is on). **Reset to the default style** brings back white text, size 36, with no outline and no box, and **Undo** also takes back style changes.
-- **Split** (in **All lines**) cuts a line in two, **Delete line** (in **Selected line**) removes it, and **+ Add line** adds a new one at the playhead. **Undo** takes back any change.
+- **Split** (in **All lines**) cuts a line in two, **Delete line** (in **Selected line**) removes it, and **+ Add line** adds a new one at the playhead. **Undo** takes back any change. When you scroll down and the buttons at the top are out of sight, **Undo** and **Redo** also float in the bottom-right corner of the screen.
 
 ### 4. Export the video
 
 Click **Export High Quality Video**. The browser plays the whole song once while it records, then writes the MP4 and downloads it. Keep the tab open and visible until the download starts. The file keeps the size of your video, or becomes 1920×1080 for a song without video.
+
+### Start a new video
+
+Click **Clear everything** at the bottom of the page. It removes the video or song, the lyrics, all lines and the style. If you change your mind, click **Undo**: everything comes back, including the video. This works until you close or reload the page.
 
 ### Your work is saved
 

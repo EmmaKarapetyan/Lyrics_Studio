@@ -95,6 +95,14 @@
       <div class="timeline"><div class="timeline-inner" id="timelineInner"><div id="ruler" class="ruler" title="Click or drag here to move through the song"></div><div id="tracks" class="tracks"><div id="grid" class="grid"></div><div id="playhead" class="playhead"></div></div></div></div>
     </section>
   </section>
+  <footer class="page-end">
+    <button type="button" class="danger" id="clearAll">Clear everything</button>
+    <span class="hint">Removes the video or song, the lyrics, all lines and the style, so you can start a new video. <b>Undo</b> brings it all back.</span>
+  </footer>
+  <div class="float-undo hidden" id="floatUndo" role="group" aria-label="Undo and redo">
+    <button type="button" class="ghost" id="floatUndoButton" title="Undo (Ctrl+Z)" disabled>↶ Undo</button>
+    <button type="button" class="ghost" id="floatRedoButton" title="Redo (Ctrl+Y)" disabled>↷ Redo</button>
+  </div>
   <section class="tap-bar hidden" id="tapBar" aria-label="Tap along">
     <div class="tap-info"><div class="hint" id="tapProgress">Line 1</div><div class="tap-next" id="tapNext"></div></div>
     <div class="tap-controls">

@@ -148,36 +148,45 @@ function restoreBlocks(state) {
   const saved = JSON.parse(state);
   blocks = saved.blocks;
   applyStyle(saved.style);
+  if (saved.page) restorePage(saved.page); // a step saved by Clear (see pageSnapshot)
   if (selected >= blocks.length) selected = blocks.length - 1;
   renderAll();
 }
+
+// Going back to a step saved by Clear must save the whole page too, so Redo can clear it again.
+const sameKindOfSnapshot = state => JSON.parse(state).page ? pageSnapshot() : snapshot();
 
 function undo() {
   const current = snapshot();
   // A saved state can equal the current one, for example when a field got focus but was not changed.
   while (undoStack.length && undoStack.at(-1) === current) undoStack.pop();
   if (!undoStack.length) { updateUndoButtons(); return status("Nothing to undo."); }
-  redoStack.push(current);
-  restoreBlocks(undoStack.pop());
+  const state = undoStack.pop();
+  redoStack.push(sameKindOfSnapshot(state));
+  restoreBlocks(state);
   updateUndoButtons();
   status("Undone. Press Redo to go forward again.");
 }
 
 function redo() {
   if (!redoStack.length) return status("Nothing to redo.");
-  undoStack.push(snapshot());
-  restoreBlocks(redoStack.pop());
+  const state = redoStack.pop();
+  undoStack.push(sameKindOfSnapshot(state));
+  restoreBlocks(state);
   updateUndoButtons();
   status("Redone.");
 }
 
 function updateUndoButtons() {
-  $("undo").disabled = !undoStack.length;
-  $("redo").disabled = !redoStack.length;
+  $("undo").disabled = $("floatUndoButton").disabled = !undoStack.length;
+  $("redo").disabled = $("floatRedoButton").disabled = !redoStack.length;
 }
 
-$("undo").onclick = undo;
-$("redo").onclick = redo;
+$("undo").onclick = $("floatUndoButton").onclick = undo;
+$("redo").onclick = $("floatRedoButton").onclick = redo;
+// When the page is scrolled down and the Undo button at the top is out of view, a copy of Undo and
+// Redo floats in the corner of the screen.
+new IntersectionObserver(([entry]) => $("floatUndo").classList.toggle("hidden", entry.isIntersecting)).observe($("undo"));
 
 // Text and number fields: remember the lines when a field gets focus and save them as an undo
 // step on the first change, so one Undo reverts the whole edit of that field.
@@ -566,12 +575,18 @@ function renderPreview() {
   }
   const wrap = $("videoWrap").getBoundingClientRect();
   const mediaBounds = getMediaBounds();
+  const left = mediaBounds.left - wrap.left, top = mediaBounds.top - wrap.top, isSelected = selected >= 0 && b === blocks[selected];
+  // While the video plays this runs on every frame. When nothing the subtitle depends on has changed
+  // since the last time, it is already right, and measuring it again would only cost time.
+  const key = JSON.stringify([b.text, b.size, b.width, b.x, b.y, style, left, top, mediaBounds.width, mediaBounds.height, isSelected]);
+  if (key === shownKey && !overlay.classList.contains("hidden")) return;
+  shownKey = key;
 
   overlay.textContent = b.text;
-  overlay.style.left = `${mediaBounds.left - wrap.left + (b.x / 100) * mediaBounds.width}px`;
-  overlay.style.top = `${mediaBounds.top - wrap.top + (b.y / 100) * mediaBounds.height}px`;
   overlay.style.fontSize = (b.size ?? style.size) + "px";
-  overlay.style.maxWidth = `${b.width ?? 80}%`;
+  // Lines break at the width set for the line, measured on the picture itself, as in the exported
+  // video (a portrait video is much narrower than the preview area). The box padding comes on top.
+  overlay.style.maxWidth = `${(b.width ?? 80) / 100 * mediaBounds.width + (style.box ? 24 : 0)}px`;
   overlay.style.color = style.color;
   overlay.style.webkitTextStroke = `${style.outlineWidth * 2}px ${style.outline}`;
   overlay.style.paintOrder = "stroke fill"; // the outline goes behind the letters, as in the exported video
@@ -582,10 +597,32 @@ function renderPreview() {
   overlay.style.boxShadow = style.box ? `0 0 0 1px ${style.boxColor}66 inset` : "none";
 
   overlay.classList.remove("hidden");
-  overlay.classList.toggle("selected", selected >= 0 && b === blocks[selected]);
+  overlay.classList.toggle("selected", isSelected);
+  // The whole subtitle stays inside the picture, also when the text is big or has many lines. A subtitle
+  // taller than the picture gets a smaller font until it fits, the same way as in the exported video.
+  const margin = mediaBounds.height * SUBTITLE_MARGIN;
+  let fontSize = b.size ?? style.size;
+  while (overlay.offsetHeight > mediaBounds.height - margin * 2 && fontSize > 8) {
+    fontSize *= 0.9;
+    overlay.style.fontSize = `${fontSize}px`;
+  }
+  const x = keepInside(left + (b.x / 100) * mediaBounds.width, overlay.offsetWidth, left, mediaBounds.width, margin);
+  const y = keepInside(top + (b.y / 100) * mediaBounds.height, overlay.offsetHeight, top, mediaBounds.height, margin);
+  overlay.style.left = `${x}px`;
+  overlay.style.top = `${y}px`;
+  shownPosition = { x: (x - left) / mediaBounds.width * 100, y: (y - top) / mediaBounds.height * 100 };
 }
 
 // The area inside the preview that the video picture really covers (without black bars).
+// The middle of a subtitle of the given size, moved as little as needed so that the whole subtitle
+// stays inside the picture (from start to start + length, with a margin). A subtitle bigger than
+// the picture is centred. The preview and the exported video both use this, so they match.
+const SUBTITLE_MARGIN = 0.02; // of the picture height
+function keepInside(middle, size, start, length, margin) {
+  const low = start + margin + size / 2, high = start + length - margin - size / 2;
+  return low > high ? start + length / 2 : Math.min(high, Math.max(low, middle));
+}
+
 function getMediaBounds() {
   const wrap = $("videoWrap").getBoundingClientRect();
   if (!video.classList.contains("hidden") && video.videoWidth && video.videoHeight) {
@@ -604,11 +641,14 @@ function getMediaBounds() {
   return wrap;
 }
 
-// Dragging the subtitle in the preview moves the selected line.
+// Dragging the subtitle in the preview moves the selected line. The drag starts from where the
+// subtitle is shown, which can differ from its saved place when it was kept inside the picture.
+let shownPosition = null, shownKey = "";
 overlay.onpointerdown = e => {
   if (selected < 0) return;
   e.preventDefault();
-  drag = { type: "position", startX: e.clientX, startY: e.clientY, x: blocks[selected].x, y: blocks[selected].y, moved: false, undo: snapshot() };
+  const from = shownPosition || blocks[selected];
+  drag = { type: "position", startX: e.clientX, startY: e.clientY, x: from.x, y: from.y, moved: false, undo: snapshot() };
   overlay.setPointerCapture(e.pointerId);
 };
 
@@ -1523,46 +1563,57 @@ async function loadFFmpeg() {
 function drawSubtitleToCanvas(ctx, b, vw, vh, previewHeight) {
   if (!b) return;
   const scale = Number.isFinite(previewHeight) && previewHeight > 0 ? vh / previewHeight : vh / 1080;
-  const fontSize = Math.max(12, Math.round((b.size ?? style.size) * scale));
-  ctx.font = `800 ${fontSize}px Inter,system-ui,sans-serif`;
+  const posX = b.x / 100 * vw, posY = b.y / 100 * vh, maxWidth = vw * ((b.width ?? 80) / 100);
+  const padX = style.box ? 12 * scale : 0, padY = style.box ? 6 * scale : 0, margin = vh * SUBTITLE_MARGIN;
+  // Wrap long lines by words, the same way the preview does.
+  const layout = size => {
+    ctx.font = `800 ${size}px Inter,system-ui,sans-serif`;
+    const lines = [];
+    String(b.text).split("\n").forEach(text => {
+      const words = text.split(/\s+/), parts = [];
+      let line = "";
+      words.forEach(word => {
+        const candidate = line ? `${line} ${word}` : word;
+        if (ctx.measureText(candidate).width <= maxWidth) { line = candidate; return; }
+        if (line) parts.push(line);
+        line = "";
+        // A word wider than the line is broken between letters, as the preview does.
+        for (const letter of word) {
+          if (line && ctx.measureText(line + letter).width > maxWidth) { parts.push(line); line = letter; } else line += letter;
+        }
+      });
+      parts.push(line);
+      lines.push(...parts);
+    });
+    let maxW = 0;
+    for (const line of lines) maxW = Math.max(maxW, ctx.measureText(line).width);
+    return { lines, maxW, totalHeight: lines.length * size * 1.2 };
+  };
+  // A subtitle taller than the picture gets a smaller font until it fits, the same way as in the preview.
+  let fontSize = Math.max(12, Math.round((b.size ?? style.size) * scale)), text = layout(fontSize);
+  while (text.totalHeight + padY * 2 > vh - margin * 2 && fontSize > 8 * scale) {
+    fontSize *= 0.9;
+    text = layout(fontSize);
+  }
+  const { lines, maxW, totalHeight } = text, lineHeight = fontSize * 1.2;
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
-  const posX = b.x / 100 * vw, posY = b.y / 100 * vh, maxWidth = vw * ((b.width ?? 80) / 100);
-  // Wrap long lines by words, the same way the preview does.
-  const lines = [];
-  String(b.text).split("\n").forEach(text => {
-    const words = text.split(/\s+/), parts = [];
-    let line = "";
-    words.forEach(word => {
-      const candidate = line ? `${line} ${word}` : word;
-      if (line && ctx.measureText(candidate).width > maxWidth) {
-        parts.push(line);
-        line = word;
-      } else {
-        line = candidate;
-      }
-    });
-    parts.push(line);
-    lines.push(...parts);
-  });
-  const lineHeight = fontSize * 1.2, totalHeight = lines.length * lineHeight;
-  let maxW = 0;
-  for (const line of lines) maxW = Math.max(maxW, ctx.measureText(line).width);
+  // The whole subtitle stays inside the picture, the same way as in the preview.
+  const centerX = keepInside(posX, maxW + padX * 2, 0, vw, margin), centerY = keepInside(posY, totalHeight + padY * 2, 0, vh, margin);
   if (style.box) {
-    const padX = 12 * scale, padY = 6 * scale;
     ctx.fillStyle = `rgba(${hexToRgb(style.boxColor)},${style.boxOpacity})`;
-    ctx.fillRect(posX - maxW / 2 - padX, posY - totalHeight / 2 - padY, maxW + padX * 2, totalHeight + padY * 2);
+    ctx.fillRect(centerX - maxW / 2 - padX, centerY - totalHeight / 2 - padY, maxW + padX * 2, totalHeight + padY * 2);
   }
   lines.forEach((line, i) => {
-    const lineY = posY - totalHeight / 2 + (i + .5) * lineHeight;
+    const lineY = centerY - totalHeight / 2 + (i + .5) * lineHeight;
     if (style.outlineWidth > 0) {
       ctx.strokeStyle = style.outline;
       ctx.lineWidth = Math.max(1, style.outlineWidth * scale * 2);
       ctx.lineJoin = "round";
-      ctx.strokeText(line, posX, lineY);
+      ctx.strokeText(line, centerX, lineY);
     }
     ctx.fillStyle = style.color;
-    ctx.fillText(line, posX, lineY);
+    ctx.fillText(line, centerX, lineY);
   });
 }
 
@@ -1784,6 +1835,96 @@ function restoreSession() {
 setInterval(autosave, 2000);
 document.addEventListener("visibilitychange", () => { if (document.hidden) autosave(); });
 window.addEventListener("pagehide", autosave);
+
+// ---------------------------------------------------------------------------
+// Clear everything, to start a new video. One Undo brings it all back.
+// ---------------------------------------------------------------------------
+
+// An Undo step stores text only, so the video, song and vocals files it needs are kept here and the
+// step stores their numbers.
+const keptFiles = new Map();
+function fileNumber(file) {
+  if (!file) return 0;
+  for (const [number, kept] of keptFiles) if (kept === file) return number;
+  keptFiles.set(keptFiles.size + 1, file);
+  return keptFiles.size;
+}
+
+// The whole page: the lines and the style, as in every Undo step, and also the lyrics, the files and
+// the Split evenly list. Only Clear saves a step like this, so undoing other changes never touches
+// the Lyrics box.
+function pageSnapshot() {
+  return JSON.stringify({ blocks, style, page: { lyrics: lyrics.value, media: fileNumber(mediaFile), vocals: fileNumber(vocalsFile), mediaName: savedMediaName, draft: manualDraft } });
+}
+
+// Shows a file in a file field again (or empties it) without choosing it anew.
+function showFileInField(input, file) {
+  try {
+    const list = new DataTransfer();
+    if (file) list.items.add(file);
+    input.files = list.files;
+  } catch {
+    if (!file) input.value = "";
+  }
+}
+
+function unloadMedia() {
+  video.pause();
+  video.onloadedmetadata = null;
+  video.onerror = null;
+  video.removeAttribute("src");
+  video.load();
+  if (mediaUrl) URL.revokeObjectURL(mediaUrl);
+  mediaUrl = null;
+  mediaFile = null;
+  video.classList.add("hidden");
+  $("emptyStage").classList.remove("hidden");
+  $("videoWrap").classList.remove("audio-only");
+  $("videoWrap").style.aspectRatio = "";
+}
+
+function restorePage(page) {
+  lyrics.value = page.lyrics;
+  manualDraft = page.draft;
+  manualSelected = -1;
+  renderManualDraft();
+  const file = keptFiles.get(page.media) || null;
+  if (file !== mediaFile) {
+    if (file) loadMedia(file); else unloadMedia();
+  }
+  vocalsFile = keptFiles.get(page.vocals) || null; // after loadMedia, which forgets the vocals of the old song
+  showFileInField(media, mediaFile);
+  showFileInField($("vocals"), vocalsFile);
+  savedMediaName = page.mediaName;
+}
+
+const pageIsEmpty = () => !mediaFile && !vocalsFile && !lyrics.value.trim() && !blocks.length && !manualDraft.length &&
+  Object.keys(DEFAULT_STYLE).every(key => style[key] === DEFAULT_STYLE[key]);
+
+$("clearAll").onclick = () => {
+  if ($("generate").disabled) return status("Wait until the AI has finished timing, then clear the page.");
+  if ($("exportVideo").disabled) return status("Wait until the export has finished, then clear the page.");
+  if (pageIsEmpty()) return status("The page is already empty.");
+  if (!confirm("Clear everything? This removes the video or song, the lyrics, all lines and the style.\n\nUntil you close or reload the page, Undo brings it all back.")) return;
+  if (tap) finishTapAlong(false);
+  pushUndo(pageSnapshot());
+  blocks = [];
+  selected = -1;
+  Object.assign(style, DEFAULT_STYLE);
+  syncStyleInputs();
+  lyrics.value = "";
+  manualDraft = [];
+  manualSelected = -1;
+  renderManualDraft();
+  vocalsFile = null;
+  unloadMedia();
+  showFileInField(media, null);
+  showFileInField($("vocals"), null);
+  savedMediaName = "";
+  renderAll();
+  status("Everything was cleared. Press Undo to bring it all back.", 0);
+  window.scrollTo({ top: 0, behavior: "smooth" });
+};
 
 // ---------------------------------------------------------------------------
 // Keyboard shortcuts
