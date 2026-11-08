@@ -76,11 +76,12 @@
           <div class="panel-body tab-panel-body">
             <div class="tab-content active" data-panel="selected" id="inspector"><div class="hint">Time your lyrics or select a line to edit it.</div></div>
             <div class="tab-content" data-panel="style" id="stylePanel">
-              <div class="editor-row"><label>Font size<input id="styleSize" type="number" min="12" max="120" value="36"></label><label>Text color<input id="styleColor" type="color" value="#ffffff"></label></div>
-              <div class="editor-row" style="margin-top:8px"><label>Outline color<input id="styleOutline" type="color" value="#000000"></label><label>Outline width<input id="styleOutlineWidth" type="number" min="0" max="12" value="0"></label></div>
-              <div class="editor-row" style="margin-top:8px"><label>Text box<input id="styleBox" type="checkbox"></label><label>Box color<input id="styleBoxColor" type="color" value="#000000"></label></div>
-              <div class="editor-row" style="margin-top:8px"><label>Box opacity<input id="styleBoxOpacity" type="range" min="0" max="1" step="0.05" value="0.35"></label><label></label></div>
-              <div class="hint" style="margin-top:8px">Default: plain white text without a background box.</div>
+              <div class="hint">These settings change every line. To give one line its own size, use <b>Selected line</b> after this.</div>
+              <div class="editor-row"><label>Text size<input id="styleSize" type="number" inputmode="numeric" min="12" max="120" step="1" value="36"></label><label>Text color<input id="styleColor" type="color" value="#ffffff"></label></div>
+              <div class="editor-row"><label>Outline width<input id="styleOutlineWidth" type="number" inputmode="numeric" min="0" max="12" step="1" value="0"></label><label>Outline color<input id="styleOutline" type="color" value="#000000"></label></div>
+              <label class="style-check"><input id="styleBox" type="checkbox"> Background box behind the text</label>
+              <div class="editor-row"><label>Box color<input id="styleBoxColor" type="color" value="#000000"></label><label>Box opacity <span id="styleBoxOpacityValue">35%</span><input id="styleBoxOpacity" type="range" min="0" max="1" step="0.05" value="0.35"></label></div>
+              <button type="button" class="ghost" id="resetStyle">Reset to the default style</button>
             </div>
             <div class="tab-content" data-panel="edit"><div id="editBlockList" class="edit-block-list"></div></div>
             <div class="tab-content" data-panel="list"><div id="blockList" class="block-list"></div></div>

@@ -31,6 +31,7 @@ let mediaFile = null, mediaUrl = null;
 let savedMediaName = ""; // file name from a restored session or project, shown as a reminder
 let manualDraft = [], manualSelected = -1;
 const style = { size: 36, color: "#ffffff", outline: "#000000", outlineWidth: 0, box: false, boxColor: "#000000", boxOpacity: 0.35 };
+const DEFAULT_STYLE = Object.freeze({ ...style });
 
 const $ = id => document.getElementById(id);
 const media = $("media"), lyrics = $("lyrics"), video = $("video"), overlay = $("overlay"), tracks = $("tracks");
@@ -131,9 +132,9 @@ function hexToRgb(hex) {
 // Undo and redo
 // ---------------------------------------------------------------------------
 
-// Every change to the lines first saves the previous lines here, so it can be undone.
+// Every change to the lines or to the Global style first saves the previous state here, so it can be undone.
 const undoStack = [], redoStack = [];
-const snapshot = () => JSON.stringify(blocks);
+const snapshot = () => JSON.stringify({ blocks, style });
 
 function pushUndo(state = snapshot()) {
   if (undoStack.at(-1) === state) return;
@@ -144,7 +145,9 @@ function pushUndo(state = snapshot()) {
 }
 
 function restoreBlocks(state) {
-  blocks = JSON.parse(state);
+  const saved = JSON.parse(state);
+  blocks = saved.blocks;
+  applyStyle(saved.style);
   if (selected >= blocks.length) selected = blocks.length - 1;
   renderAll();
 }
@@ -570,7 +573,8 @@ function renderPreview() {
   overlay.style.fontSize = (b.size ?? style.size) + "px";
   overlay.style.maxWidth = `${b.width ?? 80}%`;
   overlay.style.color = style.color;
-  overlay.style.webkitTextStroke = `${style.outlineWidth}px ${style.outline}`;
+  overlay.style.webkitTextStroke = `${style.outlineWidth * 2}px ${style.outline}`;
+  overlay.style.paintOrder = "stroke fill"; // the outline goes behind the letters, as in the exported video
 
   const boxBackground = style.box ? `rgba(${hexToRgb(style.boxColor)}, ${style.boxOpacity})` : "transparent";
   overlay.style.background = boxBackground;
@@ -1366,13 +1370,73 @@ document.querySelectorAll(".tab-button").forEach(btn => btn.onclick = () => setA
 // Global style
 // ---------------------------------------------------------------------------
 
-$("styleSize").oninput = e => { style.size = +e.target.value; renderPreview(); };
-$("styleColor").oninput = e => { style.color = e.target.value; renderPreview(); };
-$("styleOutline").oninput = e => { style.outline = e.target.value; renderPreview(); };
-$("styleOutlineWidth").oninput = e => { style.outlineWidth = +e.target.value; renderPreview(); };
-$("styleBox").onchange = e => { style.box = e.target.checked; renderPreview(); };
-$("styleBoxColor").oninput = e => { style.boxColor = e.target.value; renderPreview(); };
-$("styleBoxOpacity").oninput = e => { style.boxOpacity = +e.target.value; renderPreview(); };
+// Global style: one look for every line. Each change shows at once in the preview, is saved with the
+// project, and can be undone. The text size is for every line: changing it also replaces a size that
+// was given to a single line in Selected line.
+const STYLE_LIMITS = { size: [12, 120], outlineWidth: [0, 12], boxOpacity: [0, 1] };
+
+// Every field change is one Undo step: the state before the first change of a field is saved, and
+// the step ends when the field is left or its change is complete (for example a color is chosen).
+let styleEditTarget = null;
+function beginStyleEdit(target) {
+  if (styleEditTarget === target) return;
+  pushUndo();
+  styleEditTarget = target;
+}
+$("stylePanel").addEventListener("change", () => { styleEditTarget = null; });
+$("stylePanel").addEventListener("focusout", () => { styleEditTarget = null; });
+
+function setStyle(changes, target) {
+  beginStyleEdit(target);
+  Object.assign(style, changes);
+  if ("size" in changes) blocks.forEach(b => delete b.size);
+  updateStyleControls();
+  renderPreview();
+  renderInspector();
+}
+
+// A number field applies while typing, but only a whole value in range: an empty field, or "6" on the
+// way to "60", changes nothing yet. When the field is left, the value is put into range.
+function typedNumber(input, key) {
+  const [min, max] = STYLE_LIMITS[key], value = Number(input.value);
+  return input.value.trim() !== "" && Number.isFinite(value) && value >= min && value <= max ? Math.round(value) : null;
+}
+function finishNumber(input, key) {
+  const [min, max] = STYLE_LIMITS[key], value = Number(input.value);
+  const fixed = input.value.trim() === "" || !Number.isFinite(value) ? style[key] : Math.round(Math.min(max, Math.max(min, value)));
+  if (fixed !== style[key]) setStyle({ [key]: fixed }, input);
+  input.value = style[key];
+}
+[["styleSize", "size"], ["styleOutlineWidth", "outlineWidth"]].forEach(([id, key]) => {
+  const input = $(id);
+  input.oninput = () => { const value = typedNumber(input, key); if (value !== null && value !== style[key]) setStyle({ [key]: value }, input); };
+  input.onchange = () => finishNumber(input, key);
+  // Scrolling the page with the mouse wheel over a number field that has the focus would change it.
+  input.addEventListener("wheel", () => { if (document.activeElement === input) input.blur(); }, { passive: true });
+});
+$("styleSize").addEventListener("change", () => status(`All lines now have text size ${style.size}.`));
+
+$("styleColor").oninput = e => setStyle({ color: e.target.value }, e.target);
+$("styleOutline").oninput = e => setStyle({ outline: e.target.value }, e.target);
+$("styleBox").onchange = e => setStyle({ box: e.target.checked }, e.target);
+$("styleBoxColor").oninput = e => setStyle({ boxColor: e.target.value }, e.target);
+$("styleBoxOpacity").oninput = e => setStyle({ boxOpacity: Number(e.target.value) }, e.target);
+
+$("resetStyle").onclick = e => {
+  setStyle({ ...DEFAULT_STYLE }, e.currentTarget);
+  styleEditTarget = null;
+  syncStyleInputs();
+  status("The style is back to the default: white text, size 36, no outline and no box.");
+};
+
+// Settings that do nothing at the moment are greyed out: the outline color without an outline, and
+// the box color and opacity without a box.
+function updateStyleControls() {
+  $("styleOutline").disabled = style.outlineWidth === 0;
+  $("styleBoxColor").disabled = !style.box;
+  $("styleBoxOpacity").disabled = !style.box;
+  $("styleBoxOpacityValue").textContent = `${Math.round(style.boxOpacity * 100)}%`;
+}
 
 function syncStyleInputs() {
   $("styleSize").value = style.size;
@@ -1382,16 +1446,30 @@ function syncStyleInputs() {
   $("styleBox").checked = style.box;
   $("styleBoxColor").value = style.boxColor;
   $("styleBoxOpacity").value = style.boxOpacity;
+  updateStyleControls();
 }
 
-// Copies known style settings with the right type from a project file or the autosave.
+// Copies the style settings from a project file, the autosave or an Undo step. Values of the wrong
+// type are skipped and numbers are put into range, so a damaged file cannot hide the text.
 function applyStyle(source) {
   if (!source || typeof source !== "object") return;
   for (const key of Object.keys(style)) {
-    if (typeof source[key] === typeof style[key]) style[key] = source[key];
+    const value = source[key];
+    if (typeof value !== typeof style[key]) continue;
+    if (typeof value === "number") {
+      if (!Number.isFinite(value)) continue;
+      const [min, max] = STYLE_LIMITS[key];
+      style[key] = Math.min(max, Math.max(min, value));
+    } else if (typeof value === "string") {
+      if (/^#[0-9a-f]{6}$/i.test(value)) style[key] = value.toLowerCase();
+    } else {
+      style[key] = value;
+    }
   }
   syncStyleInputs();
 }
+
+syncStyleInputs(); // greys out what the default style does not use
 
 // ---------------------------------------------------------------------------
 // Video export

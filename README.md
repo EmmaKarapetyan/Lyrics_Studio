@@ -77,7 +77,8 @@ To fix a line:
 - **Many lines at once:** **Edit lines** shows every line with its text, start and end, so you can type them in one list.
 - **Change the order:** in **Edit lines**, drag a line by its number, or click ▲ / ▼ next to it. The times stay in their places and the lines move: the moved line takes the times of its new place, and the lines it passes shift by one place. If the **Lyrics** box has the same lines, it gets the new order too, so Tap along still works.
 - **Position on the screen:** drag the subtitle in the preview.
-- **Text, size and width:** in **Selected line**. Colors, outline and a background box for all lines: in **Global style**.
+- **One line's text, size and width:** in **Selected line**.
+- **All lines at once:** in **Global style**, set the text size, text color, an outline and a background box. Each change shows at once in the preview. The text size is for every line: it also replaces a size you gave to a single line, so give a line its own size in **Selected line** after that. Settings that do nothing yet are greyed out (the outline color until the outline has a width, the box color and opacity until the box is on). **Reset to the default style** brings back white text, size 36, with no outline and no box, and **Undo** also takes back style changes.
 - **Split** (in **All lines**) cuts a line in two, **Delete line** (in **Selected line**) removes it, and **+ Add line** adds a new one at the playhead. **Undo** takes back any change.
 
 ### 4. Export the video

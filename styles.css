@@ -1147,3 +1147,46 @@ body.tapping {
     flex: 1;
   }
 }
+
+/* Global style */
+#stylePanel > * + * {
+  margin-top: 12px;
+}
+
+#stylePanel input[type="color"] {
+  height: 34px;
+  padding: 3px;
+  cursor: pointer;
+}
+
+#stylePanel input[type="range"] {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  accent-color: var(--accent);
+}
+
+#stylePanel input:disabled {
+  opacity: .35;
+  cursor: not-allowed;
+}
+
+#styleBoxOpacityValue {
+  color: #dfe4f1;
+}
+
+.style-check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: #dfe4f1;
+  cursor: pointer;
+}
+
+.style-check input {
+  width: 18px;
+  height: 18px;
+  margin: 0;
+  accent-color: var(--accent);
+}
